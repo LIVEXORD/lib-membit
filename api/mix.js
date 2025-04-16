@@ -37,28 +37,27 @@ export default async function handler(req, res) {
       ? existingData.record.record
       : (Array.isArray(existingData.record) ? existingData.record : []);
 
-    // Cek duplikat berdasarkan pet_id
+    const added = [];
+    const skipped = [];
+
     for (const newPet of pets) {
-      if (recordList.some(item => item.pet_id === newPet.pet_id)) {
-        return res.status(400).json({ message: `Pet dengan ID ${newPet.pet_id} sudah ada!` });
+      const isDuplicateId = recordList.some(item => item.pet_id === newPet.pet_id);
+      const isDuplicateDNA = recordList.some(
+        item => item?.dna?.dna1id === newPet.dna.dna1id && item?.dna?.dna2id === newPet.dna.dna2id
+      );
+
+      if (!isDuplicateId && !isDuplicateDNA) {
+        added.push(newPet);
+      } else {
+        skipped.push(newPet);
       }
     }
 
-    // Cek duplikat kombinasi dna
-    const duplicates = pets.filter(newPet =>
-      recordList.some(
-        item =>
-          item?.dna?.dna1id === newPet.dna.dna1id &&
-          item?.dna?.dna2id === newPet.dna.dna2id
-      )
-    );
-
-    if (duplicates.length > 0) {
-      return res.status(409).json({ error: 'Some pet combinations already exist.', duplicates });
+    if (added.length === 0) {
+      return res.status(409).json({ message: 'No new pets added. All were duplicates.', skipped });
     }
 
-    // Gabungkan data baru
-    const newData = recordList.concat(pets);
+    const newData = recordList.concat(added);
 
     const updateResponse = await fetch(apiUrl, {
       method: 'PUT',
@@ -70,7 +69,11 @@ export default async function handler(req, res) {
     });
 
     if (updateResponse.ok) {
-      return res.status(201).json({ message: 'Data successfully added.', data: pets });
+      return res.status(201).json({
+        message: skipped.length > 0 ? 'Some pets were skipped due to duplicates.' : 'All pets added successfully.',
+        added,
+        skipped
+      });
     } else {
       const errorText = await updateResponse.text();
       return res.status(500).json({ error: 'Failed to update data to JSONBin.', details: errorText });
