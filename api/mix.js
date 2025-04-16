@@ -1,7 +1,8 @@
-import fs from 'fs';
-import path from 'path';
+import fetch from 'node-fetch';
 
-const filePath = path.join(process.cwd(), 'data', 'mix.json');
+const apiKey = '$2a$10$P29dHvwavEYkp6bmljw0dOSbhn8Ivy/sBoob6K/qSmu5DxUKJ8ou6';
+const binsId = '67ffa1258a456b79668aa4f1';
+const apiUrl = `https://api.jsonbin.io/v3/b/${binsId}`;
 
 export default async function handler(req, res) {
   if (req.method === 'POST') {
@@ -11,9 +12,18 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'Field tidak lengkap' });
     }
 
-    const rawData = fs.readFileSync(filePath);
-    const data = JSON.parse(rawData);
+    // Mengambil data dari JSONBins
+    const response = await fetch(apiUrl, {
+      method: 'GET',
+      headers: {
+        'X-Master-Key': apiKey,
+        'Content-Type': 'application/json',
+      },
+    });
 
+    const data = await response.json();
+
+    // Mengecek apakah kombinasi sudah ada
     const sudahAda = data.find(
       item => item.dna1 === dna1 && item.dna2 === dna2 && item.result === result
     );
@@ -22,14 +32,36 @@ export default async function handler(req, res) {
       return res.status(200).json({ message: 'Kombinasi sudah ada' });
     }
 
+    // Menambah data baru ke dalam array
     data.push({ dna1, dna2, result });
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
 
-    return res.status(201).json({ message: 'Kombinasi disimpan', data: { dna1, dna2, result } });
+    // Mengupdate data di JSONBins
+    const updateResponse = await fetch(apiUrl, {
+      method: 'PUT',
+      headers: {
+        'X-Master-Key': apiKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(data),
+    });
+
+    if (updateResponse.ok) {
+      return res.status(201).json({ message: 'Kombinasi disimpan', data: { dna1, dna2, result } });
+    } else {
+      return res.status(500).json({ error: 'Gagal menyimpan data ke JSONBins' });
+    }
 
   } else if (req.method === 'GET') {
-    const rawData = fs.readFileSync(filePath);
-    const data = JSON.parse(rawData);
+    // Mengambil data dari JSONBins
+    const response = await fetch(apiUrl, {
+      method: 'GET',
+      headers: {
+        'X-Master-Key': apiKey,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    const data = await response.json();
     return res.status(200).json(data);
   }
 
