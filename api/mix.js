@@ -1,4 +1,4 @@
-const apiKey = '$2a$10$P29dHvwavEYkp6bmljw0dOSbhn8Ivy/sBoob6K/qSmu5DxUKJ8ou6';
+const apiKey = '$2a$10$R.tpF1zMrk4inHGeWvZ6VuQjMCAwhQIpPxim6I/kzi8xUh413cE6u';
 const binsId = '67ffa1258a456b79668aa4f1';
 const apiUrl = `https://api.jsonbin.io/v3/b/${binsId}`;
 
