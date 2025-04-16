@@ -13,8 +13,6 @@ export default async function handler(req, res) {
     // Validasi setiap objek pet dalam array
     for (const pet of pets) {
       const { pet_name, pet_id, pet_class, pet_star, dna } = pet;
-
-      // Validasi field pet
       if (!pet_name || !pet_id || !pet_class || !pet_star || !dna || !dna.dna1id || !dna.dna2id) {
         return res.status(400).json({ error: 'Incomplete fields, ensure all fields are filled properly for every pet.' });
       }
@@ -25,8 +23,8 @@ export default async function handler(req, res) {
       method: 'GET',
       headers: {
         'X-Master-Key': apiKey,
-        'Content-Type': 'application/json',
-      },
+        'Content-Type': 'application/json'
+      }
     });
 
     if (!readResponse.ok) {
@@ -35,10 +33,14 @@ export default async function handler(req, res) {
 
     const existingData = await readResponse.json();
 
-    // Cek apakah kombinasi dna1id dan dna2id sudah ada untuk setiap pet
-    const duplicates = existingData.record.some(
-        item => item?.dna?.dna1id === pet.dna.dna1id && item?.dna?.dna2id === pet.dna.dna2id
-    );      
+    // Cek apakah kombinasi dna1id dan dna2id sudah ada untuk tiap pet baru
+    const duplicates = pets.filter(newPet =>
+      existingData.record.some(
+        item =>
+          item?.dna?.dna1id === newPet.dna.dna1id &&
+          item?.dna?.dna2id === newPet.dna.dna2id
+      )
+    );
 
     if (duplicates.length > 0) {
       return res.status(409).json({ error: 'Some pet combinations already exist.', duplicates });
@@ -52,25 +54,27 @@ export default async function handler(req, res) {
       method: 'PUT',
       headers: {
         'X-Master-Key': apiKey,
-        'Content-Type': 'application/json',
+        'Content-Type': 'application/json'
       },
-      body: JSON.stringify({ record: newData }),
+      body: JSON.stringify({ record: newData })
     });
 
     if (updateResponse.ok) {
       return res.status(201).json({ message: 'Data successfully added.', data: pets });
     } else {
-      return res.status(500).json({ error: 'Failed to update data to JSONBin.' });
+      // Untuk debugging, kita bisa membaca response error dari JSONBin
+      const errorText = await updateResponse.text();
+      return res.status(500).json({ error: 'Failed to update data to JSONBin.', details: errorText });
     }
-
+    
   } else if (req.method === 'GET') {
     // Mengambil data yang ada
     const response = await fetch(apiUrl, {
       method: 'GET',
       headers: {
         'X-Master-Key': apiKey,
-        'Content-Type': 'application/json',
-      },
+        'Content-Type': 'application/json'
+      }
     });
 
     if (response.ok) {
