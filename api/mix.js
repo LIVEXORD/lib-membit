@@ -36,9 +36,9 @@ export default async function handler(req, res) {
     const existingData = await readResponse.json();
 
     // Cek apakah kombinasi dna1id dan dna2id sudah ada untuk setiap pet
-    const duplicates = pets.filter(pet => 
-      existingData.record.some(item => item.dna.dna1id === pet.dna.dna1id && item.dna.dna2id === pet.dna.dna2id)
-    );
+    const duplicates = existingData.record.some(
+        item => item?.dna?.dna1id === pet.dna.dna1id && item?.dna?.dna2id === pet.dna.dna2id
+    );      
 
     if (duplicates.length > 0) {
       return res.status(409).json({ error: 'Some pet combinations already exist.', duplicates });
