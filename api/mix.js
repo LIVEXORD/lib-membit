@@ -1,89 +1,85 @@
-const apiKey = '$2a$10$R.tpF1zMrk4inHGeWvZ6VuQjMCAwhQIpPxim6I/kzi8xUh413cE6u';
+const apiKey = '$2a$10$P29dHvwavEYkp6bmljw0dOSbhn8Ivy/sBoob6K/qSmu5DxUKJ8ou6';
 const binsId = '67ffa1258a456b79668aa4f1';
 const apiUrl = `https://api.jsonbin.io/v3/b/${binsId}`;
 
 export default async function handler(req, res) {
-  // Endpoint hello untuk memastikan API bekerja
-  if (req.method === 'GET' && req.url === '/api/hello') {
-    return res.status(200).json({ message: 'Hello, World!' });
-  }
-
   if (req.method === 'POST') {
-    const { dna1, dna2, result } = req.body;
+    const pets = req.body; // Menerima array dari data pet
 
-    if (!dna1 || !dna2 || !result) {
-      return res.status(400).json({ error: 'Field tidak lengkap' });
+    if (!Array.isArray(pets) || pets.length === 0) {
+      return res.status(400).json({ error: 'Request body must be an array of pet data.' });
     }
 
-    try {
-      // Mengambil data dari JSONBins
-      const response = await fetch(apiUrl, {
-        method: 'GET',
-        headers: {
-          'X-Master-Key': apiKey,
-          'Content-Type': 'application/json',
-        },
-      });
+    // Validasi setiap objek pet dalam array
+    for (const pet of pets) {
+      const { pet_name, pet_id, pet_class, pet_star, dna } = pet;
 
-      if (!response.ok) {
-        throw new Error(`Gagal mengambil data: ${response.statusText}`);
+      // Validasi field pet
+      if (!pet_name || !pet_id || !pet_class || !pet_star || !dna || !dna.dna1id || !dna.dna2id) {
+        return res.status(400).json({ error: 'Incomplete fields, ensure all fields are filled properly for every pet.' });
       }
-
-      const data = await response.json();
-
-      // Mengecek apakah kombinasi sudah ada
-      const sudahAda = data.find(
-        item => item.dna1 === dna1 && item.dna2 === dna2 && item.result === result
-      );
-
-      if (sudahAda) {
-        return res.status(200).json({ message: 'Kombinasi sudah ada' });
-      }
-
-      // Menambah data baru ke dalam array
-      data.push({ dna1, dna2, result });
-
-      // Mengupdate data di JSONBins
-      const updateResponse = await fetch(apiUrl, {
-        method: 'PUT',
-        headers: {
-          'X-Master-Key': apiKey,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(data),
-      });
-
-      if (updateResponse.ok) {
-        return res.status(201).json({ message: 'Kombinasi disimpan', data: { dna1, dna2, result } });
-      } else {
-        return res.status(500).json({ error: 'Gagal menyimpan data ke JSONBins' });
-      }
-    } catch (error) {
-      console.error('Error:', error);
-      return res.status(500).json({ error: error.message });
     }
+
+    // Cek data yang sudah ada di JSONBin
+    const readResponse = await fetch(apiUrl, {
+      method: 'GET',
+      headers: {
+        'X-Master-Key': apiKey,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!readResponse.ok) {
+      return res.status(500).json({ error: 'Failed to fetch existing data.' });
+    }
+
+    const existingData = await readResponse.json();
+
+    // Cek apakah kombinasi dna1id dan dna2id sudah ada untuk setiap pet
+    const duplicates = pets.filter(pet => 
+      existingData.record.some(item => item.dna.dna1id === pet.dna.dna1id && item.dna.dna2id === pet.dna.dna2id)
+    );
+
+    if (duplicates.length > 0) {
+      return res.status(409).json({ error: 'Some pet combinations already exist.', duplicates });
+    }
+
+    // Jika tidak ada duplikasi, tambahkan data pet baru
+    const newData = existingData.record.concat(pets);
+
+    // Update data di JSONBin
+    const updateResponse = await fetch(apiUrl, {
+      method: 'PUT',
+      headers: {
+        'X-Master-Key': apiKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ record: newData }),
+    });
+
+    if (updateResponse.ok) {
+      return res.status(201).json({ message: 'Data successfully added.', data: pets });
+    } else {
+      return res.status(500).json({ error: 'Failed to update data to JSONBin.' });
+    }
+
   } else if (req.method === 'GET') {
-    try {
-      // Mengambil data dari JSONBins
-      const response = await fetch(apiUrl, {
-        method: 'GET',
-        headers: {
-          'X-Master-Key': apiKey,
-          'Content-Type': 'application/json',
-        },
-      });
+    // Mengambil data yang ada
+    const response = await fetch(apiUrl, {
+      method: 'GET',
+      headers: {
+        'X-Master-Key': apiKey,
+        'Content-Type': 'application/json',
+      },
+    });
 
-      if (!response.ok) {
-        throw new Error(`Gagal mengambil data: ${response.statusText}`);
-      }
-
+    if (response.ok) {
       const data = await response.json();
       return res.status(200).json(data);
-    } catch (error) {
-      console.error('Error:', error);
-      return res.status(500).json({ error: error.message });
+    } else {
+      return res.status(500).json({ error: 'Failed to fetch data from JSONBin.' });
     }
   }
 
-  res.status(405).json({ error: 'Method tidak didukung' });
+  return res.status(405).json({ error: 'Method not supported.' });
 }
