@@ -1,4 +1,4 @@
-""const apiKey = '$2a$10$R.tpF1zMrk4inHGeWvZ6VuQjMCAwhQIpPxim6I/kzi8xUh413cE6u';
+const apiKey = '$2a$10$R.tpF1zMrk4inHGeWvZ6VuQjMCAwhQIpPxim6I/kzi8xUh413cE6u';
 const binsId = '67ffa1258a456b79668aa4f1';
 const apiUrl = `https://api.jsonbin.io/v3/b/${binsId}`;
 
@@ -33,9 +33,9 @@ export default async function handler(req, res) {
     const existingData = await readResponse.json();
 
     // Tangani nested "record.record"
-    const recordList = Array.isArray(existingData.record)
-      ? existingData.record
-      : (Array.isArray(existingData.record?.record) ? existingData.record.record : []);
+    const recordList = Array.isArray(existingData.record?.record)
+      ? existingData.record.record
+      : (Array.isArray(existingData.record) ? existingData.record : []);
 
     // Cek duplikat berdasarkan pet_id
     for (const newPet of pets) {
@@ -89,9 +89,9 @@ export default async function handler(req, res) {
       const data = await response.json();
 
       // Ambil langsung record terdalam untuk menghindari nested
-      const recordList = Array.isArray(data.record)
-        ? data.record
-        : (Array.isArray(data.record?.record) ? data.record.record : []);
+      const recordList = Array.isArray(data.record?.record)
+        ? data.record.record
+        : (Array.isArray(data.record) ? data.record : []);
 
       return res.status(200).json({ record: recordList });
     } else {
