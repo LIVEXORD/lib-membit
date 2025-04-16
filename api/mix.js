@@ -5,6 +5,11 @@ const binsId = '67ffa1258a456b79668aa4f1';
 const apiUrl = `https://api.jsonbin.io/v3/b/${binsId}`;
 
 export default async function handler(req, res) {
+  // Endpoint hello untuk memastikan API bekerja
+  if (req.method === 'GET' && req.url === '/api/hello') {
+    return res.status(200).json({ message: 'Hello, World!' });
+  }
+
   if (req.method === 'POST') {
     const { dna1, dna2, result } = req.body;
 
