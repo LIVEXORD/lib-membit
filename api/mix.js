@@ -31,7 +31,13 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: 'Failed to fetch existing data.' });
     }
 
-    const existingData = await readResponse.json();
+    const existingData = await response.json();
+    const recordList = Array.isArray(existingData.record) ? existingData.record : [];
+
+    if (recordList.some(item => item.pet_id === newPet.pet_id)) {
+      return res.status(400).json({ message: "Pet sudah ada!" });
+    }
+
 
     // Cek apakah kombinasi dna1id dan dna2id sudah ada untuk tiap pet baru
     const duplicates = pets.filter(newPet =>
