@@ -1,3 +1,6 @@
+import fs from 'fs';
+import path from 'path';
+
 // Fungsi untuk load accounts.json dan mengembalikan array accounts
 function loadAccounts() {
   const filePath = path.resolve('./accounts.json');
