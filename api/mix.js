@@ -62,7 +62,7 @@ export default async function handler(req, res) {
 
     // Jika tidak ada data baru, beri pesan
     if (added.length === 0) {
-      return res.status(409).json({ message: 'No new items.', skipped });
+      return res.status(201).json({ message: 'No new items.', skipped });
     }
 
     // Step 3: Gabungkan data lama dan yang baru
