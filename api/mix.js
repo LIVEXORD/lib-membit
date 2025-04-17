@@ -9,22 +9,24 @@ function loadAccounts() {
 }
 
 export default async function handler(req, res) {
-  // CORS
+  // CORS headers (opsional, sesuaikan kebutuhan)
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  if (req.method === 'OPTIONS') return res.status(200).end();
+
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
 
   const accounts = loadAccounts();
 
   if (req.method === 'POST') {
     const pets = req.body;
-    // validasi
     if (!Array.isArray(pets) || pets.length === 0) {
-      return res.status(400).json({ error: 'Body must be a non-empty array.' });
+      return res.status(400).json({ error: 'Request body must be an array.' });
     }
 
-    // 1) Ambil & gabungkan data lama dari semua akun
+    // Step 1: Ambil dan gabungkan semua data lama
     let allData = [];
     for (const acct of accounts) {
       const url = `https://api.jsonbin.io/v3/b/${acct.binId}/latest`;
@@ -33,7 +35,7 @@ export default async function handler(req, res) {
         headers: { 'X-Master-Key': acct.apiKey }
       });
       if (!r.ok) {
-        return res.status(500).json({ error: `Fetch failed on ${acct.name}` });
+        return res.status(500).json({ error: `Failed to fetch from ${acct.name}` });
       }
       const { record } = await r.json();
       const list = Array.isArray(record?.record)
@@ -42,58 +44,62 @@ export default async function handler(req, res) {
       allData = allData.concat(list);
     }
 
-    // 2) Filter duplikat & kumpulkan yang baru
+    // Step 2: Filter duplicates dan simpan data yang belum ada
     const added = [];
     const skipped = [];
     for (const pet of pets) {
-      const dupId = allData.some(x => x.pet_id === pet.pet_id);
+      const dupId  = allData.some(x => x.pet_id === pet.pet_id);
       const dupDna = allData.some(x =>
         x.dna?.dna1id === pet.dna.dna1id &&
         x.dna?.dna2id === pet.dna.dna2id
       );
-      dupId || dupDna ? skipped.push(pet) : added.push(pet);
+      if (dupId || dupDna) {
+        skipped.push(pet);  // Simpan yang duplikat
+      } else {
+        added.push(pet);  // Simpan yang baru
+      }
     }
+
+    // Jika tidak ada data baru, beri pesan
     if (added.length === 0) {
       return res.status(409).json({ message: 'No new items.', skipped });
     }
 
+    // Step 3: Gabungkan data lama dan yang baru
     const newData = allData.concat(added);
 
-    // 3) Push update ke semua akun, kumpulkan hasilnya
-    const updateResults = [];
+    // Step 4: Update data ke setiap akun, pastikan tidak ada data lebih lama
     for (const acct of accounts) {
       const url = `https://api.jsonbin.io/v3/b/${acct.binId}`;
-      try {
-        const u = await fetch(url, {
-          method: 'PUT',
-          headers: {
-            'X-Master-Key': acct.apiKey,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({ record: newData })
+      const u = await fetch(url, {
+        method: 'PUT',
+        headers: {
+          'X-Master-Key': acct.apiKey,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ record: newData })
+      });
+
+      const responseText = await u.text();  // Dapatkan respons dalam bentuk teks
+      console.log('Response from PUT request:', responseText);  // Tambahkan logging untuk mengecek respon
+
+      if (!u.ok) {
+        return res.status(500).json({
+          error: `Failed to update ${acct.name}`,
+          details: responseText
         });
-        if (u.ok) {
-          updateResults.push({ name: acct.name, status: 'success' });
-        } else {
-          const details = await u.text();
-          updateResults.push({ name: acct.name, status: 'failed', details });
-        }
-      } catch (err) {
-        updateResults.push({ name: acct.name, status: 'error', message: err.message });
       }
     }
 
+    // Step 5: Kirim response
     return res.status(201).json({
-      message: skipped.length
-        ? 'Some items skipped (dupes), see updateResults'
-        : 'All new items added, see updateResults',
+      message: skipped.length ? 'Some skipped (dupes)' : 'All added',
       added,
-      skipped,
-      updateResults
+      skipped
     });
   }
   else if (req.method === 'GET') {
-    // Gabungkan data dari semua akun
+    // Gabungkan semua data dari setiap akun
     let allData = [];
     for (const acct of accounts) {
       const url = `https://api.jsonbin.io/v3/b/${acct.binId}/latest`;
@@ -102,7 +108,7 @@ export default async function handler(req, res) {
         headers: { 'X-Master-Key': acct.apiKey }
       });
       if (!r.ok) {
-        return res.status(500).json({ error: `Fetch failed on ${acct.name}` });
+        return res.status(500).json({ error: `Failed to fetch from ${acct.name}` });
       }
       const { record } = await r.json();
       const list = Array.isArray(record?.record)
