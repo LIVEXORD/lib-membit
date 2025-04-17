@@ -3,7 +3,7 @@ import path from 'path';
 
 // Fungsi untuk load accounts.json dan mengembalikan array accounts
 function loadAccounts() {
-  const filePath = path.resolve('./accounts.json');
+  const filePath = path.join(process.cwd(), 'accounts.json');
   const raw = fs.readFileSync(filePath, 'utf-8');
   const parsed = JSON.parse(raw);
   return parsed.accounts;    // akses ke properti "accounts"
