@@ -1,0 +1,15 @@
+{
+    "accounts": [
+      {
+        "name": "akun1",
+        "apiKey": "$2a$10$R.tpF1zMrk4inHGeWvZ6VuQjMCAwhQIpPxim6I/kzi8xUh413cE6u",
+        "binId": "67ffa1258a456b79668aa4f1"
+      },
+      {
+        "name": "akun2",
+        "apiKey": "$2a$10$qoZWFYtpZASHKTQUwyiWKOOkZeZu1JXWyPSM4eb9X2y.c438ITRc.",
+        "binId": "68009e4a8561e97a5001579b"
+      } 
+    ]
+  }
+  

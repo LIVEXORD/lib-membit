@@ -1,106 +1,116 @@
-const apiKey = '$2a$10$R.tpF1zMrk4inHGeWvZ6VuQjMCAwhQIpPxim6I/kzi8xUh413cE6u';
-const binsId = '67ffa1258a456b79668aa4f1';
-const apiUrl = `https://api.jsonbin.io/v3/b/${binsId}`;
+import fs from 'fs';
+import path from 'path';
+import fetch from 'node-fetch';
+
+// Fungsi untuk load accounts.json dan mengembalikan array accounts
+function loadAccounts() {
+  const filePath = path.resolve('./accounts.json');
+  const raw = fs.readFileSync(filePath, 'utf-8');
+  const parsed = JSON.parse(raw);
+  return parsed.accounts;    // akses ke properti "accounts"
+}
 
 export default async function handler(req, res) {
-  if (req.method === 'POST') {
-    const pets = req.body; // Menerima array dari data pet
+  // CORS headers (opsional, sesuaikan kebutuhan)
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-    if (!Array.isArray(pets) || pets.length === 0) {
-      return res.status(400).json({ error: 'Request body must be an array of pet data.' });
-    }
-
-    for (const pet of pets) {
-      const { pet_name, pet_id, pet_class, pet_star, dna } = pet;
-      if (!pet_name || !pet_id || !pet_class || !pet_star || !dna || !dna.dna1id || !dna.dna2id) {
-        return res.status(400).json({ error: 'Incomplete fields, ensure all fields are filled properly for every pet.' });
-      }
-    }
-
-    // Ambil data dari JSONBin
-    const readResponse = await fetch(apiUrl, {
-      method: 'GET',
-      headers: {
-        'X-Master-Key': apiKey,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    if (!readResponse.ok) {
-      return res.status(500).json({ error: 'Failed to fetch existing data.' });
-    }
-
-    const existingData = await readResponse.json();
-
-    // Tangani nested "record.record"
-    const recordList = Array.isArray(existingData.record?.record)
-      ? existingData.record.record
-      : (Array.isArray(existingData.record) ? existingData.record : []);
-
-    const added = [];
-    const skipped = [];
-
-    for (const newPet of pets) {
-      const isDuplicateId = recordList.some(item => item.pet_id === newPet.pet_id);
-      const isDuplicateDNA = recordList.some(
-        item => item?.dna?.dna1id === newPet.dna.dna1id && item?.dna?.dna2id === newPet.dna.dna2id
-      );
-
-      if (!isDuplicateId && !isDuplicateDNA) {
-        added.push(newPet);
-      } else {
-        skipped.push(newPet);
-      }
-    }
-
-    if (added.length === 0) {
-      return res.status(409).json({ message: 'No new pets added. All were duplicates.', skipped });
-    }
-
-    const newData = recordList.concat(added);
-
-    const updateResponse = await fetch(apiUrl, {
-      method: 'PUT',
-      headers: {
-        'X-Master-Key': apiKey,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ record: newData })
-    });
-
-    if (updateResponse.ok) {
-      return res.status(201).json({
-        message: skipped.length > 0 ? 'Some pets were skipped due to duplicates.' : 'All pets added successfully.',
-        added,
-        skipped
-      });
-    } else {
-      const errorText = await updateResponse.text();
-      return res.status(500).json({ error: 'Failed to update data to JSONBin.', details: errorText });
-    }
-
-  } else if (req.method === 'GET') {
-    const response = await fetch(apiUrl, {
-      method: 'GET',
-      headers: {
-        'X-Master-Key': apiKey,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    if (response.ok) {
-      const data = await response.json();
-
-      // Ambil langsung record terdalam untuk menghindari nested
-      const recordList = Array.isArray(data.record?.record)
-        ? data.record.record
-        : (Array.isArray(data.record) ? data.record : []);
-
-      return res.status(200).json({ record: recordList });
-    } else {
-      return res.status(500).json({ error: 'Failed to fetch data from JSONBin.' });
-    }
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
   }
 
-  return res.status(405).json({ error: 'Method not supported.' });
+  const accounts = loadAccounts();
+
+  if (req.method === 'POST') {
+    const pets = req.body;
+    if (!Array.isArray(pets) || pets.length === 0) {
+      return res.status(400).json({ error: 'Request body must be an array.' });
+    }
+
+    // Step 1: Ambil dan gabungkan semua data lama
+    let allData = [];
+    for (const acct of accounts) {
+      const url = `https://api.jsonbin.io/v3/b/${acct.binId}/latest`;
+      const r = await fetch(url, {
+        method: 'GET',
+        headers: { 'X-Master-Key': acct.apiKey }
+      });
+      if (!r.ok) {
+        return res.status(500).json({ error: `Failed to fetch from ${acct.name}` });
+      }
+      const { record } = await r.json();
+      // record bisa nested di record.record atau langsung record
+      const list = Array.isArray(record?.record)
+        ? record.record
+        : (Array.isArray(record) ? record : []);
+      allData = allData.concat(list);
+    }
+
+    // Step 2: Filter duplicates, kumpulkan yang baru
+    const added = [];
+    const skipped = [];
+    for (const pet of pets) {
+      const dupId  = allData.some(x => x.pet_id === pet.pet_id);
+      const dupDna = allData.some(x =>
+        x.dna?.dna1id === pet.dna.dna1id &&
+        x.dna?.dna2id === pet.dna.dna2id
+      );
+      (dupId || dupDna) ? skipped.push(pet) : added.push(pet);
+    }
+    if (added.length === 0) {
+      return res.status(409).json({ message: 'No new items.', skipped });
+    }
+
+    const newData = allData.concat(added);
+
+    // Step 3: Push update ke semua akun
+    for (const acct of accounts) {
+      const url = `https://api.jsonbin.io/v3/b/${acct.binId}`;
+      const u = await fetch(url, {
+        method: 'PUT',
+        headers: {
+          'X-Master-Key': acct.apiKey,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ record: newData })
+      });
+      if (!u.ok) {
+        const txt = await u.text();
+        return res.status(500).json({
+          error: `Failed to update ${acct.name}`,
+          details: txt
+        });
+      }
+    }
+
+    return res.status(201).json({
+      message: skipped.length ? 'Some skipped (dupes)' : 'All added',
+      added,
+      skipped
+    });
+  }
+  else if (req.method === 'GET') {
+    // Gabungkan semua data dari setiap akun
+    let allData = [];
+    for (const acct of accounts) {
+      const url = `https://api.jsonbin.io/v3/b/${acct.binId}/latest`;
+      const r = await fetch(url, {
+        method: 'GET',
+        headers: { 'X-Master-Key': acct.apiKey }
+      });
+      if (!r.ok) {
+        return res.status(500).json({ error: `Failed to fetch from ${acct.name}` });
+      }
+      const { record } = await r.json();
+      const list = Array.isArray(record?.record)
+        ? record.record
+        : (Array.isArray(record) ? record : []);
+      allData = allData.concat(list);
+    }
+    return res.status(200).json({ record: allData });
+  }
+  else {
+    return res.status(405).json({ error: 'Method not supported.' });
+  }
 }
