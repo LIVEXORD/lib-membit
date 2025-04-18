@@ -105,6 +105,10 @@ export default async function handler(req, res) {
           globalThis._cacheData.gistSha
         );
       }
+      // Di atas return res.status(200)
+      if (Date.now() - globalThis._cacheData.lastUpdate > CACHE_DURATION) {
+        await saveData(globalThis._cacheData.data, globalThis._cacheData.gistSha);
+      }
 
       return res.status(200).json({ record: data });
     }
