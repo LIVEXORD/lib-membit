@@ -137,7 +137,7 @@ export default async function handler(req, res) {
       }
 
       if (added.length === 0) {
-        return res.status(201).json({ message: "No new items.", skipped });
+        return res.status(200).json({ message: "No new items.", skipped });
       }
 
       const newData = allData.concat(added);
@@ -156,7 +156,7 @@ export default async function handler(req, res) {
         // Store in memory cache until next push
         globalThis._cacheData.data = newData;
         return res
-          .status(202)
+          .status(201)
           .json({
             message: "Cached temporarily. Will push soon.",
             added,
