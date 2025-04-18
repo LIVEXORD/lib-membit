@@ -15,6 +15,14 @@ async function saveData(newArray, sha) {
     },
   };
 
+  // Inisialisasi global cache jika belum ada
+  if (!globalThis._cacheData) {
+    globalThis._cacheData = {
+      data: [],
+      lastUpdate: 0,
+      gistSha: "",
+    };
+  }
   const res = await fetch(GIST_API, {
     method: "PATCH",
     headers: {
