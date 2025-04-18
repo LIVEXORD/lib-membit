@@ -96,6 +96,25 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
 
   try {
+    if (req.method === "POST" && req.url === "/api/force-push") {
+      const { token } = req.body;
+
+      // Simple security check biar gak sembarang orang bisa pakai
+      if (token !== process.env.DEV_PUSH_TOKEN) {
+        return res.status(403).json({ error: "Unauthorized" });
+      }
+
+      try {
+        await saveData(
+          globalThis._cacheData.data,
+          globalThis._cacheData.gistSha
+        );
+        return res.status(200).json({ message: "Forced push success" });
+      } catch (err) {
+        return res.status(500).json({ error: err.message });
+      }
+    }
+
     if (req.method === "GET") {
       const { data } = await loadData();
 
@@ -104,10 +123,6 @@ export default async function handler(req, res) {
           globalThis._cacheData.data,
           globalThis._cacheData.gistSha
         );
-      }
-      // Di atas return res.status(200)
-      if (Date.now() - globalThis._cacheData.lastUpdate > CACHE_DURATION) {
-        await saveData(globalThis._cacheData.data, globalThis._cacheData.gistSha);
       }
 
       return res.status(200).json({ record: data });
@@ -145,23 +160,19 @@ export default async function handler(req, res) {
       // Only push if more than CACHE_DURATION since last update
       if (Date.now() - globalThis._cacheData.lastUpdate > CACHE_DURATION) {
         await saveData(newData, sha);
-        return res
-          .status(201)
-          .json({
-            message: skipped.length ? "Some skipped (dupes)" : "All added",
-            added,
-            skipped,
-          });
+        return res.status(201).json({
+          message: skipped.length ? "Some skipped (dupes)" : "All added",
+          added,
+          skipped,
+        });
       } else {
         // Store in memory cache until next push
         globalThis._cacheData.data = newData;
-        return res
-          .status(201)
-          .json({
-            message: "Cached temporarily. Will push soon.",
-            added,
-            skipped,
-          });
+        return res.status(201).json({
+          message: "Cached temporarily. Will push soon.",
+          added,
+          skipped,
+        });
       }
     }
 
