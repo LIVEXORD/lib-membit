@@ -158,7 +158,26 @@ export default async function handler(req, res) {
       }
     }
 
-    res.setHeader("Allow", "GET, POST, OPTIONS");
+    // Handle PATCH request
+    if (req.method === "PATCH") {
+      const { data } = req.body;
+
+      if (!Array.isArray(data) || data.length === 0) {
+        return res
+          .status(400)
+          .json({ error: "Request body must be a non-empty array of data." });
+      }
+
+      const { sha } = globalThis._cacheData;
+      await saveData(data, sha);
+
+      return res.status(200).json({
+        message: "Data updated successfully.",
+        updatedData: data,
+      });
+    }
+
+    res.setHeader("Allow", "GET, POST, PATCH, OPTIONS");
     return res.status(405).json({ error: "Method not supported." });
   } catch (err) {
     console.error(err);
