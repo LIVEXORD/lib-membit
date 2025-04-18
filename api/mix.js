@@ -11,9 +11,11 @@ if (!globalThis._cacheData) {
 
 async function loadData() {
   const now = Date.now();
-  if (now - globalThis._cacheData.lastUpdate < CACHE_DURATION && globalThis._cacheData.data.length) {
+  // Return cached if still valid
+  if (now - globalThis._cacheData.lastUpdate < CACHE_DURATION && Array.isArray(globalThis._cacheData.data) && globalThis._cacheData.data.length) {
     return { data: globalThis._cacheData.data, sha: globalThis._cacheData.gistSha };
   }
+  // Fetch from Gist
   const gistRes = await fetch(GIST_API, { headers: { Authorization: `token ${GITHUB_TOKEN}` } });
   if (!gistRes.ok) throw new Error(`Failed to fetch gist: ${gistRes.status}`);
   const gistJson = await gistRes.json();
@@ -22,11 +24,8 @@ async function loadData() {
   const rawRes = await fetch(file.raw_url);
   if (!rawRes.ok) throw new Error(`Failed to fetch raw content: ${rawRes.status}`);
   const json = await rawRes.json();
-  const dataArray = Array.isArray(json)
-    ? json
-    : Array.isArray(json.record)
-    ? json.record
-    : [];
+  const dataArray = Array.isArray(json) ? json : (Array.isArray(json.record) ? json.record : []);
+  // Update cache
   globalThis._cacheData = { data: dataArray, gistSha: file.sha, lastUpdate: now };
   return { data: dataArray, sha: file.sha };
 }
@@ -48,6 +47,7 @@ async function saveData(newArray, sha) {
     const err = await res.text();
     throw new Error(`Failed to update gist: ${res.status} - ${err}`);
   }
+  // Update cache after successful push
   globalThis._cacheData.data = newArray;
   globalThis._cacheData.gistSha = sha;
   globalThis._cacheData.lastUpdate = Date.now();
@@ -67,7 +67,7 @@ export default async function handler(req, res) {
         return res.status(403).json({ error: "Unauthorized" });
       }
       const { data, gistSha } = globalThis._cacheData;
-      if (!Array.isArray(data) || !data.length || !gistSha) {
+      if (!Array.isArray(data) || data.length === 0 || !gistSha) {
         return res.status(400).json({ error: "No cached data to push" });
       }
       await saveData(data, gistSha);
@@ -77,6 +77,7 @@ export default async function handler(req, res) {
     // 2) Get data
     if (req.method === "GET") {
       const { data } = await loadData();
+      // Auto-push if cache expired
       if (Date.now() - globalThis._cacheData.lastUpdate > CACHE_DURATION) {
         await saveData(globalThis._cacheData.data, globalThis._cacheData.gistSha);
       }
@@ -86,25 +87,27 @@ export default async function handler(req, res) {
     // 3) Add new items via POST
     if (req.method === "POST") {
       const items = req.body;
-      if (!Array.isArray(items) || !items.length) {
+      if (!Array.isArray(items) || items.length === 0) {
         return res.status(400).json({ error: "Request body must be a non-empty array" });
       }
       const { data: existing, sha } = await loadData();
       const added = [];
       const skipped = [];
       for (const it of items) {
-        const dup = existing.some(x => x.pet_id === it.pet_id || (x.dna?.dna1id === it.dna?.dna1id && x.dna?.dna2id === it.dna?.dna2id));
-        if (dup) skipped.push(it);
+        const isDup = existing.some(x => x.pet_id === it.pet_id || (x.dna?.dna1id === it.dna?.dna1id && x.dna?.dna2id === it.dna?.dna2id));
+        if (isDup) skipped.push(it);
         else added.push(it);
       }
-      if (!added.length) {
+      if (added.length === 0) {
         return res.status(200).json({ message: "No new items", skipped });
       }
       const merged = existing.concat(added);
+      // Push immediately if cache expired
       if (Date.now() - globalThis._cacheData.lastUpdate > CACHE_DURATION) {
         await saveData(merged, sha);
         return res.status(201).json({ message: skipped.length ? "Partial added" : "All added", added, skipped });
       }
+      // Else cache until next PUT
       globalThis._cacheData.data = merged;
       return res.status(202).json({ message: "Cached until next push", added, skipped });
     }
