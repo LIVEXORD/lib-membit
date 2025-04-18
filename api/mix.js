@@ -96,24 +96,6 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(200).end();
 
   try {
-    if (req.method === "POST" && req.url === "/api/force-push") {
-      const { token } = req.body;
-
-      // Simple security check biar gak sembarang orang bisa pakai
-      if (token !== process.env.DEV_PUSH_TOKEN) {
-        return res.status(403).json({ error: "Unauthorized" });
-      }
-
-      try {
-        await saveData(
-          globalThis._cacheData.data,
-          globalThis._cacheData.gistSha
-        );
-        return res.status(200).json({ message: "Forced push success" });
-      } catch (err) {
-        return res.status(500).json({ error: err.message });
-      }
-    }
 
     if (req.method === "GET") {
       const { data } = await loadData();
