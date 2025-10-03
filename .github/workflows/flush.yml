@@ -11,7 +11,7 @@ jobs:
     steps:
       - name: Call collector flush
         env:
-          ENDPOINT: https://your-vercel-app.vercel.app/api/collector?flush=1
+          ENDPOINT: https://lib-membit.vercel.app//api/collector?flush=1
           API_SECRET: ${{ secrets.COLLECTOR_API_SECRET }}
         run: |
           if [ -n "$API_SECRET" ]; then
