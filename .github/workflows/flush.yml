@@ -1,0 +1,21 @@
+name: Flush membit every 30 minutes
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  flush:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call collector flush
+        env:
+          ENDPOINT: https://your-vercel-app.vercel.app/api/collector?flush=1
+          API_SECRET: ${{ secrets.COLLECTOR_API_SECRET }}
+        run: |
+          if [ -n "$API_SECRET" ]; then
+            curl -s -X GET "$ENDPOINT" -H "X-SECRET: $API_SECRET" -w "\nHTTP:%{http_code}\n"
+          else
+            curl -s -X GET "$ENDPOINT" -w "\nHTTP:%{http_code}\n"
+          fi
