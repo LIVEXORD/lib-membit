@@ -401,7 +401,8 @@ async function safeAppendToGist(gistEntry, incomingItems){
 }
 
 // ----------------- ROUTES -----------------
-app.options("/collector", (req, res) => {
+// Support both root (when deployed as api/collector) and explicit /collector paths
+app.options(["/collector", "/"], (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-SECRET");
@@ -409,7 +410,7 @@ app.options("/collector", (req, res) => {
 });
 
 // POST /collector
-app.post("/collector", async (req, res) => {
+app.post(["/collector", "/"], async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   try {
     await checkAndResetDaily();
@@ -507,7 +508,7 @@ app.post("/collector", async (req, res) => {
 
 // GET /collector with batch support
 // query: ?batch=1&batch_size=200
-app.get("/collector", async (req, res) => {
+app.get(["/collector", "/"], async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   try {
     await checkAndResetDaily();
@@ -569,7 +570,10 @@ app.get("/health", (req, res) => {
 // app directly usually works: Vercel will call it as a Node.js serverless function (app is a function).
 // If you prefer to keep serverless-http for other providers, you can revert to `export default serverless(app);`.
 
-export default app;
+import serverless from "serverless-http";
+
+// Export serverless handler for Vercel — this provides the proper (req,res) function wrapper
+export default serverless(app);
 
 /*
 DEPLOY NOTES (Vercel):
