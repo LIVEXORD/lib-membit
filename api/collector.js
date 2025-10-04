@@ -20,7 +20,7 @@ if (process.env.NODE_ENV !== "production") {
 }
 
 if (process.env.NODE_ENV === "production") {
-  ensureDailyCheckOnce(); // best-effort
+  checkAndResetDaily(); // best-effort
 }
 
 const app = express();
