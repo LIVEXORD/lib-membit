@@ -1,8 +1,8 @@
 // api/collector.js
-// Minimal Collector: Upstash Redis only + daily reset
+// Minimal Collector: Upstash Redis only + daily reset (safe flush)
 // - POST: accept array or { posts: [...] } -> push to input:list (dedupe in input:seen)
 // - GET: read paginated from read:list, support ?batches=1,2,3 & ?batch_size=200 OR cursor/limit
-// - ?flush=1 : flush staged input -> dedupe -> append to read
+// - ?flush=1 : flush staged input -> dedupe (against READ_LIST) -> append to read
 
 import { Redis } from "@upstash/redis";
 
@@ -45,18 +45,6 @@ async function releaseLock() {
   } catch {}
 }
 
-async function popChunk(n = CHUNK_SIZE) {
-  const out = [];
-  for (let i = 0; i < n; i++) {
-    const s = await redis.lpop(INPUT_LIST);
-    if (!s) break;
-    try {
-      out.push(JSON.parse(s));
-    } catch {}
-  }
-  return out;
-}
-
 async function readSlice(offset, count) {
   const end = offset + count - 1;
   const arr = await redis.lrange(READ_LIST, offset, end);
@@ -72,33 +60,17 @@ function itemIdOf(it) {
   return it?.rest_id ?? it?.id ?? null;
 }
 
-function mergeUniqueByRestId(existingArr, incomingArr) {
-  const map = new Map();
-  for (const e of existingArr) {
-    const id = itemIdOf(e);
-    if (id) map.set(String(id), e);
-    else map.set(JSON.stringify(e).slice(0, 50) + Math.random(), e);
-  }
-  for (const it of incomingArr) {
-    const id = itemIdOf(it);
-    if (!id) {
-      it._generated_id = `_noid_${Math.random().toString(36).slice(2, 9)}`;
-      map.set(`g_${it._generated_id}`, it);
-      continue;
-    }
-    if (!map.has(String(id))) map.set(String(id), it);
-  }
-  return Array.from(map.values());
-}
-
 // --- Auto-reset Redis per day
+// NOTE: to preserve user's read archive, we only clear INPUT_LIST & INPUT_SEEN on day change.
+// This keeps READ_LIST / READ_SEEN intact so users can still read past items.
 async function checkAndResetDaily() {
   const today = utcYMD();
   const lastDate = await redis.get(LAST_DATE_KEY);
   if (lastDate !== today) {
-    await redis.del(INPUT_LIST, INPUT_SEEN, READ_LIST, READ_SEEN);
+    // clear input queue + input seen only
+    await redis.del(INPUT_LIST, INPUT_SEEN);
     await redis.set(LAST_DATE_KEY, today);
-    console.log("Redis reset for new day", today);
+    console.log("Redis INPUT reset for new day", today);
   }
 }
 
@@ -125,12 +97,19 @@ export default async function handler(req, res) {
             return res.status(401).json({ error: "Invalid flush secret" });
           }
         }
+
         const token = await acquireLock();
         if (!token) return res.status(423).json({ error: "Flush in progress" });
 
         try {
-          // --- improved flush logic ---
-          // preload current READ_LIST ids once (to avoid lrange per item)
+          // SAFE FLUSH FLOW (read all input, then process, then clear input)
+          // 1) read all input items (batching via CHUNK_SIZE to avoid memory spike if necessary)
+          const rawInput = await redis.lrange(INPUT_LIST, 0, -1); // strings
+          if (!rawInput || rawInput.length === 0) {
+            return res.status(200).json({ message: "Flush complete", pushed: 0 });
+          }
+
+          // 2) preload read-list ids into a Set for fast lookup
           const rawRead = await redis.lrange(READ_LIST, 0, -1);
           const readIdSet = new Set();
           for (const s of rawRead) {
@@ -141,40 +120,54 @@ export default async function handler(req, res) {
             } catch {}
           }
 
+          // 3) process input array in chunks (to avoid huge synchronous loops)
           let toPushAll = [];
-          while (true) {
-            const chunk = await popChunk(CHUNK_SIZE);
-            if (!chunk.length) break;
-
+          for (let i = 0; i < rawInput.length; i += CHUNK_SIZE) {
+            const batch = rawInput.slice(i, i + CHUNK_SIZE);
             const newOnes = [];
-            for (const it of chunk) {
-              const id = itemIdOf(it);
 
-              if (!id) {
-                // no stable id → accept and generate one
-                it._generated_id = `_noid_${Math.random().toString(36).slice(2, 9)}`;
+            for (const s of batch) {
+              try {
+                const it = JSON.parse(s);
+                const id = itemIdOf(it);
+
+                if (!id) {
+                  // no stable id → accept and generate one
+                  it._generated_id = `_noid_${Math.random().toString(36).slice(2, 9)}`;
+                  newOnes.push(it);
+                  continue;
+                }
+
+                // If id already exists in READ_LIST (tracked in readIdSet), skip
+                if (readIdSet.has(String(id))) {
+                  // already in read_list -> skip
+                  continue;
+                }
+
+                // Not present in read_list -> safe to push
                 newOnes.push(it);
-                continue;
+                // mark locally so following items in same flush know it's now present
+                readIdSet.add(String(id));
+              } catch {
+                // ignore malformed entries
               }
-
-              // If id already exists in READ_LIST (tracked in readIdSet), skip
-              if (readIdSet.has(String(id))) {
-                // already in read_list -> skip
-                continue;
-              }
-
-              // Not present in read_list -> safe to push (covers both new & "seen-but-not-pushed" recover)
-              await redis.rpush(READ_LIST, JSON.stringify(it));
-              // ensure READ_SEEN contains it (idempotent)
-              await redis.sadd(READ_SEEN, String(id));
-              readIdSet.add(String(id)); // update local cache so subsequent checks are fast
-              newOnes.push(it);
             }
 
             if (newOnes.length) {
+              // push the batch into READ_LIST and update READ_SEEN
+              const jsons = newOnes.map((x) => JSON.stringify(x));
+              await redis.rpush(READ_LIST, ...jsons);
+              // add ids to READ_SEEN where possible
+              for (const it of newOnes) {
+                const id = itemIdOf(it);
+                if (id) await redis.sadd(READ_SEEN, String(id));
+              }
               toPushAll.push(...newOnes);
             }
           }
+
+          // 4) after processing everything, clear input queue (we already consumed rawInput)
+          await redis.del(INPUT_LIST);
 
           return res.status(200).json({ message: "Flush complete", pushed: toPushAll.length });
         } finally {
@@ -191,7 +184,10 @@ export default async function handler(req, res) {
       const total = await redis.llen(READ_LIST);
 
       if (batchesParam) {
-        const parts = batchesParam.split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => Number.isFinite(n) && n > 0);
+        const parts = batchesParam
+          .split(",")
+          .map((s) => parseInt(s.trim(), 10))
+          .filter((n) => Number.isFinite(n) && n > 0);
         const result = [];
         for (const idx of parts) {
           const start = (idx - 1) * batchSize;
@@ -202,7 +198,10 @@ export default async function handler(req, res) {
       }
 
       const cursor = Math.max(parseInt(url.searchParams.get("cursor") || "0", 10) || 0, 0);
-      const limit = Math.min(Math.max(parseInt(url.searchParams.get("limit") || String(batchSize), 10) || batchSize, 1), 1000);
+      const limit = Math.min(
+        Math.max(parseInt(url.searchParams.get("limit") || String(batchSize), 10) || batchSize, 1),
+        1000
+      );
       const slice = await readSlice(cursor, limit);
       const nextCursor = cursor + slice.length;
       return res.status(200).json({ record: slice, cursor: nextCursor, total });
@@ -222,6 +221,7 @@ export default async function handler(req, res) {
           await redis.rpush(INPUT_LIST, JSON.stringify(it));
           accepted++;
         } else {
+          // dedupe at input-queue level so same id not enqueued repeatedly
           const added = await redis.sadd(INPUT_SEEN, String(id));
           if (added === 1) {
             await redis.rpush(INPUT_LIST, JSON.stringify(it));
