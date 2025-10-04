@@ -1,17 +1,8 @@
-// collector.js
-// ESM Express app — stateless, Vercel-ready.
+// collector-fixed.js
+// ESM Express app — Vercel-ready (patched for timeouts, parallel reads, and safer retries).
 // Dependencies: express, body-parser, morgan, node-fetch
 // Install: npm i express body-parser morgan node-fetch
-//
-// ENV variables (see .env.example) should be set in Vercel project settings.
-//
-// Behavior summary:
-// - POST /collector: dedupe against data_id_global, attempt to persist to data_utama gists (fill sequentially).
-//   Uses optimistic-sync: re-fetch latest gist and retry patch on conflicts (limited attempts).
-// - GET /collector: merge all data_utama gists, supports pagination via ?batch & ?batch_size (default batch_size=200).
-// - Daily auto-reset (UTC Y-M-D): stored automatically in chosen gist (auto-picked if not configured).
-// - Multi GitHub tokens supported (round-robin + backoff on 429/5xx).
-// - Export default app for Vercel; also listens locally when NODE_ENV !== 'production'.
+// IMPORTANT: set env vars in Vercel project settings. See notes at bottom of file.
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -32,14 +23,16 @@ const DATA_UTAMA_GISTS = (process.env.GIST_DATA_UTAMA || "")
 const GIST_ID_GLOBAL = (process.env.GIST_ID_GLOBAL || "").trim() || null;
 const GIST_DATA_TANGGAL = (process.env.GIST_DATA_TANGGAL || "").trim() || null;
 
+// Tunable defaults (made more conservative for serverless)
 const MAX_ITEMS_PER_FILE = Math.max(1, parseInt(process.env.MAX_ITEMS_PER_FILE || "1000", 10));
-const MAX_RETRIES = Math.max(1, parseInt(process.env.MAX_RETRIES || "3", 10));
+const MAX_RETRIES = Math.max(1, parseInt(process.env.MAX_RETRIES || "2", 10)); // reduced default
 const RETRY_BASE_MS = Math.max(50, parseInt(process.env.RETRY_BASE_MS || "300", 10));
 const TOKEN_BACKOFF_SEC = Math.max(5, parseInt(process.env.TOKEN_BACKOFF_SEC || "60", 10));
 const USER_AGENT = process.env.USER_AGENT || "membit-collector";
-const MAX_SYNC_ATTEMPTS = Math.max(1, parseInt(process.env.MAX_SYNC_ATTEMPTS || "6", 10));
+const MAX_SYNC_ATTEMPTS = Math.max(1, parseInt(process.env.MAX_SYNC_ATTEMPTS || "3", 10)); // reduced default
 const SYNC_RETRY_BASE_MS = Math.max(50, parseInt(process.env.SYNC_RETRY_BASE_MS || "200", 10));
 const READ_BATCH_SIZE = Math.min(Math.max(parseInt(process.env.READ_BATCH_SIZE || "200", 10), 1), 500);
+const FETCH_TIMEOUT_MS = Math.max(1000, parseInt(process.env.FETCH_TIMEOUT_MS || "8000", 10));
 
 // ----------------- small utils -----------------
 function nowMs(){ return Date.now(); }
@@ -75,35 +68,66 @@ async function ghFetch(url, opts = {}){
   const headers = Object.assign({}, opts.headers || {});
   headers["User-Agent"] = USER_AGENT;
   if (token) headers["Authorization"] = `token ${token}`;
-  const finalOpts = Object.assign({}, opts, { headers });
-  const res = await fetch(url, finalOpts);
-  return { res, token };
+
+  // AbortController timeout (Node 18+ in Vercel provides global AbortController)
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const finalOpts = Object.assign({}, opts, { headers, signal: controller.signal });
+    const start = Date.now();
+    const res = await fetch(url, finalOpts);
+    const took = Date.now() - start;
+    console.log(`[ghFetch] url=${url} status=${res.status} token=${token? 'yes':'no'} took=${took}ms`);
+    return { res, token };
+  } catch (e){
+    if (e.name === 'AbortError') {
+      console.warn(`[ghFetch] timeout for ${url} after ${FETCH_TIMEOUT_MS}ms`);
+    } else {
+      console.warn(`[ghFetch] error fetching ${url}: ${e.message}`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function ghFetchWithRetries(url, opts = {}){
   let lastErr = null;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++){
     try {
+      console.log(`[ghFetchWithRetries] attempt=${attempt+1}/${MAX_RETRIES} url=${url}`);
       const { res, token } = await ghFetch(url, opts);
       if (res.status === 429){
-        if (token) disableTokenFor(token, TOKEN_BACKOFF_SEC);
+        if (token) {
+          disableTokenFor(token, TOKEN_BACKOFF_SEC);
+          console.warn(`[ghFetchWithRetries] 429 -> disabling token for ${TOKEN_BACKOFF_SEC}s`);
+        }
         const text = await res.text().catch(()=>"");
         lastErr = new Error(`GitHub 429: ${text}`);
-        await sleep(RETRY_BASE_MS * Math.pow(2, attempt));
+        const backoff = RETRY_BASE_MS * Math.pow(2, attempt);
+        console.log(`[ghFetchWithRetries] sleeping ${backoff}ms after 429`);
+        await sleep(backoff);
         continue;
       }
       if (res.status >= 500){
-        if (token) disableTokenFor(token, Math.max(5, Math.floor(TOKEN_BACKOFF_SEC/4)));
+        if (token) {
+          disableTokenFor(token, Math.max(5, Math.floor(TOKEN_BACKOFF_SEC/4)));
+          console.warn(`[ghFetchWithRetries] ${res.status} -> temporary disable token`);
+        }
         const text = await res.text().catch(()=>"");
         lastErr = new Error(`GitHub ${res.status}: ${text}`);
-        await sleep(RETRY_BASE_MS * Math.pow(2, attempt));
+        const backoff = RETRY_BASE_MS * Math.pow(2, attempt);
+        console.log(`[ghFetchWithRetries] sleeping ${backoff}ms after ${res.status}`);
+        await sleep(backoff);
         continue;
       }
       // return res (200..499) to caller
       return { res, token };
     } catch (e){
       lastErr = e;
-      await sleep(RETRY_BASE_MS * Math.pow(2, attempt));
+      const backoff = RETRY_BASE_MS * Math.pow(2, attempt);
+      console.log(`[ghFetchWithRetries] fetch error (${e.message}), sleeping ${backoff}ms before retry`);
+      await sleep(backoff);
       continue;
     }
   }
@@ -149,7 +173,6 @@ async function patchGistWithRetries(gistId, filesObj){
 }
 
 // ----------------- Date gist selection & daily reset -----------------
-// pick gist to store date: prefer explicit GIST_DATA_TANGGAL, else GIST_ID_GLOBAL, else first DATA_UTAMA_GISTS
 function pickDateGistId(){
   if (process.env.GIST_DATA_TANGGAL && process.env.GIST_DATA_TANGGAL.trim()) return process.env.GIST_DATA_TANGGAL.trim();
   if (GIST_ID_GLOBAL) return GIST_ID_GLOBAL;
@@ -189,7 +212,8 @@ async function writeDateToSelectedGist(dateStr){
   }
 }
 async function clearAllDataUtamaAndIdGlobal(){
-  for (const gid of DATA_UTAMA_GISTS) {
+  // clear data_utama in parallel (safe in most cases)
+  await Promise.allSettled(DATA_UTAMA_GISTS.map(async (gid) => {
     try {
       const gi = await fetchGistContent(gid);
       const filename = gi.filename || "data_utama.json";
@@ -200,7 +224,9 @@ async function clearAllDataUtamaAndIdGlobal(){
     } catch (e) {
       console.warn(`Failed clearing data_utama gist ${gid}: ${e.message}`);
     }
-  }
+  }));
+
+  // clear global id gist (single)
   if (GIST_ID_GLOBAL) {
     try {
       const gi = await fetchGistContent(GIST_ID_GLOBAL);
@@ -262,21 +288,21 @@ async function writeIdGlobalSet(idArray){
 
 // ----------------- data_utama helpers -----------------
 async function readAllDataUtama(){
-  const out = [];
-  for (const gid of DATA_UTAMA_GISTS){
+  // parallelize reads to reduce total latency
+  const promises = DATA_UTAMA_GISTS.map(async (gid) => {
     try {
       const g = await fetchGistContent(gid);
       let arr = [];
       if (Array.isArray(g.content)) arr = g.content;
       else if (g.content && Array.isArray(g.content.posts)) arr = g.content.posts;
       else arr = [];
-      out.push({ gistId: gid, filename: g.filename || "data_utama.json", array: arr });
-    } catch (e){
+      return { gistId: gid, filename: g.filename || "data_utama.json", array: arr };
+    } catch (e) {
       console.warn(`readAllDataUtama: can't read gist ${gid}: ${e.message}`);
-      out.push({ gistId: gid, filename: "data_utama.json", array: [] });
+      return { gistId: gid, filename: "data_utama.json", array: [] };
     }
-  }
-  return out;
+  });
+  return Promise.all(promises);
 }
 
 // ----------------- SAFE append (optimistic sync) -----------------
@@ -381,6 +407,13 @@ app.post("/collector", async (req, res) => {
     }
 
     const dataUtamaList = await readAllDataUtama();
+
+    // Quick capacity check to avoid heavy work when there's absolutely no room
+    const capacities = dataUtamaList.map(d => Math.max(0, MAX_ITEMS_PER_FILE - (Array.isArray(d.array) ? d.array.length : 0)));
+    const totalCap = capacities.reduce((a,b) => a + b, 0);
+    if (totalCap === 0){
+      return res.status(202).json({ accepted: newItemsObjs.length, skipped, stored: 0, not_stored: newItemsObjs.length, warning: "No capacity in DATA_UTAMA gists" });
+    }
 
     let remaining = newItemsObjs.slice();
     const storedItems = [];
@@ -496,3 +529,23 @@ app.get("/health", (req, res) => {
 import serverless from "serverless-http";
 
 export default serverless(app);
+
+/*
+DEPLOY NOTES (Vercel):
+- Add/Update environment variables in your Vercel Project > Settings > Environment Variables:
+  - GITHUB_TOKENS (comma-separated)
+  - GIST_DATA_UTAMA (comma-separated gist IDs)
+  - GIST_ID_GLOBAL (optional)
+  - GIST_DATA_TANGGAL (optional)
+  - FETCH_TIMEOUT_MS (ms, default 8000)
+  - MAX_RETRIES (default reduced to 2)
+  - MAX_SYNC_ATTEMPTS (default reduced to 3)
+- Redeploy the project after updating env vars.
+- Monitor function logs in Vercel to confirm reduced timeouts and watch ghFetch logs.
+
+WHY THESE CHANGES:
+- Adds fetch timeout via AbortController to avoid hanging network calls.
+- Parallelizes expensive reads/clears to reduce total latency in serverless environment.
+- Lowers retry/sync defaults to fail-fast and avoid long backoff loops inside a single request.
+- Adds logging so you can observe where time is spent in requests.
+*/
