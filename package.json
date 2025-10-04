@@ -1,18 +1,19 @@
 {
   "name": "lib-membit",
   "version": "1.0.0",
-  "main": "membit-collector-server.js",
+  "main": "collector.js",
   "type": "module",
   "scripts": {
     "dev": "vercel dev",
-    "start": "node -r dotenv/config membit-collector-server.js"
+    "start": "node -r dotenv/config collector.js"
   },
   "dependencies": {
     "@upstash/redis": "^1.35.4",
-    "dotenv": "^17.2.3",
-    "node-fetch": "^3.3.2",
-    "express": "^4.18.2",
     "body-parser": "^1.20.2",
-    "morgan": "^1.10.0"
+    "dotenv": "^17.2.3",
+    "express": "^4.18.2",
+    "morgan": "^1.10.0",
+    "node-fetch": "^3.3.2",
+    "serverless-http": "^4.0.0"
   }
 }
