@@ -1,286 +1,342 @@
-/*
-membit-collector-server.js
-Full Express server implementation of your Upstash-only collector.
-Features:
-- POST /collector : push items to INPUT_LIST with dedupe against READ_SEEN and INPUT_SEEN
-- GET /collector  : read from READ_LIST (cursor/limit or batches)
-- GET /collector?flush=1 : move items from INPUT_LIST -> READ_LIST with dedupe (requires X-SECRET when FLUSH_SECRET set)
-- Daily auto-reset (based on server date UTC Y-M-D)
-- Safe bootstrap: if READ_LIST exists but contains non-JSON placeholder, it will be cleared
-- Safer flush using RPOPLPUSH -> PROCESSING_LIST pattern (atomic-ish) and requeue/cleanup
-- Startup recovery for PROCESSING_LIST
-
-Env variables:
-- UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN (used by @upstash/redis via Redis.fromEnv())
-- FLUSH_SECRET (optional) - required header X-SECRET for flush
-- CHUNK_SIZE (default 100) - how many attempts per flush loop
-- BATCH_SIZE (default 200) - default read batch when batching
-- PORT (default 3000)
-
-Install:
-  npm init -y
-  npm i express @upstash/redis body-parser morgan
-Run:
-  node membit-collector-server.js
-
-*/
+// membit-collector-server.js
+// ESM Express app — stateless, Vercel-ready.
+// Dependencies: express, body-parser, morgan, node-fetch
+// Install: npm i express body-parser morgan node-fetch
+//
+// ENV variables (see .env.example) should be set in Vercel project settings.
+//
+// Behavior summary:
+// - POST /collector: dedupe against data_id_global, attempt to persist to data_utama gists (fill sequentially).
+//   Uses optimistic-sync: re-fetch latest gist and retry patch on conflicts (limited attempts).
+// - GET /collector: merge all data_utama gists, supports pagination via ?batch & ?batch_size (default batch_size=200).
+// - Daily auto-reset (UTC Y-M-D): stored automatically in chosen gist (auto-picked if not configured).
+// - Multi GitHub tokens supported (round-robin + backoff on 429/5xx).
+// - Export default app for Vercel; also listens locally when NODE_ENV !== 'production'.
 
 import express from "express";
 import bodyParser from "body-parser";
 import morgan from "morgan";
-import { Redis } from "@upstash/redis";
-
-const redis = Redis.fromEnv();
+import fetch from "node-fetch";
 
 const app = express();
 app.use(morgan("tiny"));
 app.use(bodyParser.json({ limit: "2mb" }));
 
-// --- CONFIG
-const FLUSH_SECRET = process.env.FLUSH_SECRET || null;
-const CHUNK_SIZE = parseInt(process.env.CHUNK_SIZE || "100", 10);
-const READ_BATCH_SIZE = Math.min(
-  Math.max(parseInt(process.env.BATCH_SIZE || "200", 10), 1),
-  500
-);
-const LAST_DATE_KEY = "membit:last_date";
+// ----------------- CONFIG (ENV) -----------------
+const TOKENS = (process.env.GITHUB_TOKENS || "")
+  .split(",").map(s => s.trim()).filter(Boolean);
 
-// --- KEYS
-const INPUT_LIST = "membit:input:list";
-const INPUT_SEEN = "membit:input:seen";
-const READ_LIST = "membit:read:list";
-const READ_SEEN = "membit:read:seen";
-const LOCK_FLUSH = "membit:lock:flush";
-const PROCESSING_LIST = "membit:processing:list";
+const DATA_UTAMA_GISTS = (process.env.GIST_DATA_UTAMA || "")
+  .split(",").map(s => s.trim()).filter(Boolean);
 
-// --- helpers
-function utcYMD(d = new Date()) {
-  return d.toISOString().slice(0, 10);
-}
-function itemIdOf(it) {
-  return it?.rest_id ?? it?.id ?? null;
-}
+const GIST_ID_GLOBAL = (process.env.GIST_ID_GLOBAL || "").trim() || null;
+const GIST_DATA_TANGGAL = (process.env.GIST_DATA_TANGGAL || "").trim() || null;
 
-async function acquireLock(ttlMs = 60000) {
-  const token = `t-${Math.random().toString(36).slice(2, 9)}`;
-  try {
-    const ok = await redis.setnx(LOCK_FLUSH, token);
-    if (ok === 1) {
-      await redis.pexpire(LOCK_FLUSH, ttlMs);
-      return token;
+const MAX_ITEMS_PER_FILE = Math.max(1, parseInt(process.env.MAX_ITEMS_PER_FILE || "1000", 10));
+const MAX_RETRIES = Math.max(1, parseInt(process.env.MAX_RETRIES || "3", 10));
+const RETRY_BASE_MS = Math.max(50, parseInt(process.env.RETRY_BASE_MS || "300", 10));
+const TOKEN_BACKOFF_SEC = Math.max(5, parseInt(process.env.TOKEN_BACKOFF_SEC || "60", 10));
+const USER_AGENT = process.env.USER_AGENT || "membit-collector";
+const MAX_SYNC_ATTEMPTS = Math.max(1, parseInt(process.env.MAX_SYNC_ATTEMPTS || "6", 10));
+const SYNC_RETRY_BASE_MS = Math.max(50, parseInt(process.env.SYNC_RETRY_BASE_MS || "200", 10));
+const READ_BATCH_SIZE = Math.min(Math.max(parseInt(process.env.READ_BATCH_SIZE || "200", 10), 1), 500);
+
+// ----------------- small utils -----------------
+function nowMs(){ return Date.now(); }
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+function utcYMD(d = new Date()){ return d.toISOString().slice(0, 10); }
+
+// ----------------- Token rotation & simple backoff -----------------
+const tokenDisabledUntil = {}; // token -> timestamp ms
+function isTokenAvailable(token){ return (tokenDisabledUntil[token] || 0) <= nowMs(); }
+
+let tokenIndex = 0;
+function pickNextAvailableToken(){
+  if (!TOKENS.length) return null;
+  const start = tokenIndex % TOKENS.length;
+  for (let i = 0; i < TOKENS.length; i++){
+    const idx = (start + i) % TOKENS.length;
+    const t = TOKENS[idx];
+    if (isTokenAvailable(t)){
+      tokenIndex = (idx + 1) % TOKENS.length;
+      return t;
     }
-    return null;
-  } catch (e) {
-    console.warn("acquireLock error", e?.message ?? e);
-    return null;
   }
+  return null;
 }
-async function releaseLock() {
+function disableTokenFor(token, sec){
+  if (!token) return;
+  tokenDisabledUntil[token] = nowMs() + sec * 1000;
+}
+
+// ----------------- GitHub Gist helpers with retry & token fallback -----------------
+async function ghFetch(url, opts = {}){
+  const token = pickNextAvailableToken();
+  const headers = Object.assign({}, opts.headers || {});
+  headers["User-Agent"] = USER_AGENT;
+  if (token) headers["Authorization"] = `token ${token}`;
+  const finalOpts = Object.assign({}, opts, { headers });
+  const res = await fetch(url, finalOpts);
+  return { res, token };
+}
+
+async function ghFetchWithRetries(url, opts = {}){
+  let lastErr = null;
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++){
+    try {
+      const { res, token } = await ghFetch(url, opts);
+      if (res.status === 429){
+        if (token) disableTokenFor(token, TOKEN_BACKOFF_SEC);
+        const text = await res.text().catch(()=>"");
+        lastErr = new Error(`GitHub 429: ${text}`);
+        await sleep(RETRY_BASE_MS * Math.pow(2, attempt));
+        continue;
+      }
+      if (res.status >= 500){
+        if (token) disableTokenFor(token, Math.max(5, Math.floor(TOKEN_BACKOFF_SEC/4)));
+        const text = await res.text().catch(()=>"");
+        lastErr = new Error(`GitHub ${res.status}: ${text}`);
+        await sleep(RETRY_BASE_MS * Math.pow(2, attempt));
+        continue;
+      }
+      // return res (200..499) to caller
+      return { res, token };
+    } catch (e){
+      lastErr = e;
+      await sleep(RETRY_BASE_MS * Math.pow(2, attempt));
+      continue;
+    }
+  }
+  throw lastErr || new Error("ghFetchWithRetries failed");
+}
+
+// fetch gist and parse sensible file (prefers data_utama.json / data_id_global.json / data_tanggal.json)
+async function fetchGistContent(gistId){
+  const url = `https://api.github.com/gists/${gistId}`;
+  const { res } = await ghFetchWithRetries(url, { method: "GET" });
+  if (!res.ok){
+    const text = await res.text().catch(()=>"");
+    throw new Error(`Failed fetching gist ${gistId}: ${res.status} ${text}`);
+  }
+  const js = await res.json();
+  const files = js.files || {};
+  const preferredNames = ["data_utama.json", "data_id_global.json", "data_tanggal.json"];
+  let chosenName = Object.keys(files)[0] || null;
+  for (const pn of preferredNames){
+    if (files[pn]) { chosenName = pn; break; }
+  }
+  if (!chosenName) return { gistMeta: js, filename: null, content: null, contentRaw: null };
+  const file = files[chosenName];
+  const contentRaw = file.content || "";
+  let parsed = null;
+  try { parsed = JSON.parse(contentRaw); } catch (e) { parsed = null; }
+  return { gistMeta: js, filename: chosenName, content: parsed, contentRaw };
+}
+
+async function patchGistWithRetries(gistId, filesObj){
+  const url = `https://api.github.com/gists/${gistId}`;
+  const opts = {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", "User-Agent": USER_AGENT },
+    body: JSON.stringify({ files: filesObj })
+  };
+  const { res } = await ghFetchWithRetries(url, opts);
+  if (!res.ok){
+    const text = await res.text().catch(()=>"");
+    throw new Error(`Failed PATCH gist ${gistId}: ${res.status} ${text}`);
+  }
+  return res.json();
+}
+
+// ----------------- Date gist selection & daily reset -----------------
+// pick gist to store date: prefer explicit GIST_DATA_TANGGAL, else GIST_ID_GLOBAL, else first DATA_UTAMA_GISTS
+function pickDateGistId(){
+  if (process.env.GIST_DATA_TANGGAL && process.env.GIST_DATA_TANGGAL.trim()) return process.env.GIST_DATA_TANGGAL.trim();
+  if (GIST_ID_GLOBAL) return GIST_ID_GLOBAL;
+  if (DATA_UTAMA_GISTS && DATA_UTAMA_GISTS.length > 0) return DATA_UTAMA_GISTS[0];
+  return null;
+}
+async function getDateFromSelectedGist(){
+  const gid = pickDateGistId();
+  if (!gid) return null;
   try {
-    await redis.del(LOCK_FLUSH);
+    const { filename, content } = await fetchGistContent(gid);
+    if (!content) return null;
+    if (typeof content === "string") return content;
+    if (content.last_date) return String(content.last_date);
+    if (content.date) return String(content.date);
+    return null;
   } catch (e) {
-    console.warn("releaseLock", e?.message ?? e);
+    console.warn("getDateFromSelectedGist warning:", e.message);
+    return null;
   }
 }
-
-// --- startup recovery: move any leftover processing items back to input (safe restart)
-async function recoverProcessingList() {
-  const procLen = Number((await redis.llen(PROCESSING_LIST)) || 0);
-  if (procLen === 0) return 0;
-  let moved = 0;
-  while (true) {
-    const itm = await redis.rpop(PROCESSING_LIST);
-    if (!itm) break;
-    await redis.lpush(INPUT_LIST, itm);
-    moved++;
+async function writeDateToSelectedGist(dateStr){
+  const gid = pickDateGistId();
+  if (!gid) {
+    console.warn("writeDateToSelectedGist: no gist available to write date");
+    return null;
   }
-  console.warn(
-    `Recovered ${moved} items from processing list back to input list`
-  );
-  return moved;
+  try {
+    const gistInfo = await fetchGistContent(gid);
+    const filename = gistInfo.filename || "data_tanggal.json";
+    const filesObj = {};
+    filesObj[filename] = { content: JSON.stringify({ last_date: dateStr }, null, 2) };
+    return await patchGistWithRetries(gid, filesObj);
+  } catch (e) {
+    console.warn("writeDateToSelectedGist error:", e.message);
+    return null;
+  }
 }
-
-// --- daily reset
-async function checkAndResetDaily() {
+async function clearAllDataUtamaAndIdGlobal(){
+  for (const gid of DATA_UTAMA_GISTS) {
+    try {
+      const gi = await fetchGistContent(gid);
+      const filename = gi.filename || "data_utama.json";
+      const filesObj = {};
+      filesObj[filename] = { content: JSON.stringify([], null, 2) };
+      await patchGistWithRetries(gid, filesObj);
+      console.log(`Cleared data_utama gist ${gid}`);
+    } catch (e) {
+      console.warn(`Failed clearing data_utama gist ${gid}: ${e.message}`);
+    }
+  }
+  if (GIST_ID_GLOBAL) {
+    try {
+      const gi = await fetchGistContent(GIST_ID_GLOBAL);
+      const filename = gi.filename || "data_id_global.json";
+      const filesObj = {};
+      filesObj[filename] = { content: JSON.stringify({ seen: [] }, null, 2) };
+      await patchGistWithRetries(GIST_ID_GLOBAL, filesObj);
+      console.log("Cleared data_id_global gist");
+    } catch (e) {
+      console.warn("Failed clearing data_id_global:", e.message);
+    }
+  }
+}
+async function checkAndResetDaily(){
   const today = utcYMD();
   try {
-    const lastDate = await redis.get(LAST_DATE_KEY);
-    if (lastDate !== today) {
-      await redis.del(INPUT_LIST, INPUT_SEEN, READ_LIST, READ_SEEN);
-      await redis.set(LAST_DATE_KEY, today);
-      console.log("Redis reset for new day:", today);
+    const last = await getDateFromSelectedGist();
+    if (last === today) return;
+    console.log("Daily reset triggered. last_date:", last, "today:", today);
+    const dateGistId = pickDateGistId();
+    if (!dateGistId) {
+      console.warn("checkAndResetDaily: no gist configured to store date - skipping reset");
+      return;
     }
+    await clearAllDataUtamaAndIdGlobal();
+    await writeDateToSelectedGist(today);
+    console.log("Daily reset complete:", today);
   } catch (e) {
-    console.warn("checkAndResetDaily error", e?.message ?? e);
+    console.warn("checkAndResetDaily error:", e.message ?? e);
   }
 }
 
-// --- validate read list content (detect placeholder)
-async function readListLooksValid() {
-  const first = await redis.lindex(READ_LIST, 0);
-  if (!first) return false;
+// ----------------- id_global helpers -----------------
+async function getIdGlobalSet(){
+  if (!GIST_ID_GLOBAL) return new Set();
   try {
-    JSON.parse(first);
-    return true;
-  } catch {
-    return false;
+    const { filename, content } = await fetchGistContent(GIST_ID_GLOBAL);
+    if (!content) return new Set();
+    let arr = [];
+    if (Array.isArray(content)) arr = content;
+    else if (Array.isArray(content.seen)) arr = content.seen;
+    else if (Array.isArray(content.ids)) arr = content.ids;
+    else return new Set();
+    return new Set(arr.map(String));
+  } catch (e){
+    console.warn("getIdGlobalSet warning:", e.message);
+    return new Set();
   }
 }
-
-// --- ensure bootstrap
-async function ensureReadStructures() {
-  const totalRead = Number((await redis.llen(READ_LIST)) || 0);
-
-  // if read list has content but is not valid JSON, clear it (likely manual placeholder)
-  if (totalRead > 0) {
-    const valid = await readListLooksValid();
-    if (!valid) {
-      console.warn(
-        "READ_LIST contains non-json placeholder — clearing read:list & read:seen"
-      );
-      await redis.del(READ_LIST, READ_SEEN);
-    }
-  }
-
-  const totalAfter = Number((await redis.llen(READ_LIST)) || 0);
-  if (totalAfter === 0) {
-    const inputs = await redis.lrange(INPUT_LIST, 0, -1);
-    if (!inputs || inputs.length === 0) return 0;
-
-    let moved = 0;
-    for (const s of inputs) {
-      let obj = null;
-      try {
-        obj = JSON.parse(s);
-      } catch {
-        obj = { text: s };
-      }
-
-      try {
-        const id = itemIdOf(obj);
-        await redis.rpush(READ_LIST, JSON.stringify(obj));
-        if (id) await redis.sadd(READ_SEEN, String(id));
-        moved++;
-      } catch (e) {
-        console.error("Failed pushing to read structures:", e?.message ?? e);
-      }
-    }
-
-    if (moved > 0) {
-      await redis.del(INPUT_LIST, INPUT_SEEN);
-    } else {
-      console.warn(
-        "ensureReadStructures: found input list but moved 0 items — leaving INPUT_LIST intact"
-      );
-    }
-
-    return moved;
-  }
-  return -1;
+async function writeIdGlobalSet(idArray){
+  if (!GIST_ID_GLOBAL) throw new Error("GIST_ID_GLOBAL not configured");
+  const payload = JSON.stringify({ seen: idArray }, null, 2);
+  const gistInfo = await fetchGistContent(GIST_ID_GLOBAL);
+  const filename = gistInfo.filename || "data_id_global.json";
+  const filesObj = {};
+  filesObj[filename] = { content: payload };
+  return await patchGistWithRetries(GIST_ID_GLOBAL, filesObj);
 }
 
-// --- flush logic (safe with processing list)
-async function flushAll() {
-  // first try bootstrap path
-  const boot = await ensureReadStructures();
-  if (boot >= 0) {
-    return { flushed: boot, bootstrap: true };
-  }
-
-  let flushed = 0;
-  // Use RPOPLPUSH to move items to PROCESSING_LIST so we don't lose items on crash
-  while (true) {
-    // rpoplpush returns element or null
-    const s = await redis.rpoplpush(INPUT_LIST, PROCESSING_LIST);
-    if (!s) break; // no more
-
-    let parsed = null;
+// ----------------- data_utama helpers -----------------
+async function readAllDataUtama(){
+  const out = [];
+  for (const gid of DATA_UTAMA_GISTS){
     try {
-      parsed = JSON.parse(s);
-    } catch {}
+      const g = await fetchGistContent(gid);
+      let arr = [];
+      if (Array.isArray(g.content)) arr = g.content;
+      else if (g.content && Array.isArray(g.content.posts)) arr = g.content.posts;
+      else arr = [];
+      out.push({ gistId: gid, filename: g.filename || "data_utama.json", array: arr });
+    } catch (e){
+      console.warn(`readAllDataUtama: can't read gist ${gid}: ${e.message}`);
+      out.push({ gistId: gid, filename: "data_utama.json", array: [] });
+    }
+  }
+  return out;
+}
 
-    if (!parsed) {
-      // can't parse: push to read as raw object and remove from processing
-      const obj = { text: s };
-      try {
-        await redis.rpush(READ_LIST, JSON.stringify(obj));
-        flushed++;
-      } catch (e) {
-        console.error("Failed pushing raw to READ_LIST", e?.message ?? e);
-        // if failed, move back to input to avoid data loss
-        await redis.lpush(INPUT_LIST, s);
-      }
-      // remove the item from processing (first occurrence)
-      await redis.lrem(PROCESSING_LIST, 1, s);
+// ----------------- SAFE append (optimistic sync) -----------------
+function jitterBackoff(attempt, baseMs = SYNC_RETRY_BASE_MS){
+  const exp = Math.pow(2, attempt) * baseMs;
+  const jitter = Math.floor(Math.random() * baseMs);
+  return exp + jitter;
+}
+
+/*
+ gistEntry: { gistId, filename, array: existingArray }
+ incomingItems: array of objects to store
+ returns { stored: [...], notStored: [...], updatedArray: [...] }
+*/
+async function safeAppendToGist(gistEntry, incomingItems){
+  const { gistId, filename } = gistEntry;
+  let remaining = incomingItems.slice();
+  const storedTotal = [];
+
+  for (let attempt = 0; attempt < MAX_SYNC_ATTEMPTS && remaining.length > 0; attempt++){
+    let latest;
+    try {
+      latest = await fetchGistContent(gistId);
+    } catch (e){
+      console.warn(`safeAppendToGist: fetch failed (attempt ${attempt}) for ${gistId}: ${e.message}`);
+      await sleep(jitterBackoff(attempt));
       continue;
     }
 
-    const id = itemIdOf(parsed);
-    if (!id) {
-      try {
-        // no id -> push to read list with generated id
-        parsed._generated_id = `_noid_${Math.random()
-          .toString(36)
-          .slice(2, 9)}`;
-        await redis.rpush(READ_LIST, JSON.stringify(parsed));
-        flushed++;
-      } catch (e) {
-        console.error(
-          "Failed pushing noid parsed item to READ_LIST",
-          e?.message ?? e
-        );
-        await redis.lpush(INPUT_LIST, s);
-      }
-      await redis.lrem(PROCESSING_LIST, 1, s);
-      continue;
+    let existingArray = [];
+    if (Array.isArray(latest.content)) existingArray = latest.content;
+    else if (latest.content && Array.isArray(latest.content.posts)) existingArray = latest.content.posts;
+    else existingArray = [];
+
+    const available = Math.max(0, MAX_ITEMS_PER_FILE - existingArray.length);
+    if (available <= 0){
+      return { stored: storedTotal, notStored: remaining, updatedArray: existingArray };
     }
+
+    const toTake = remaining.slice(0, available);
+    const newArray = existingArray.concat(toTake);
+    const payload = JSON.stringify(newArray, null, 2);
+    const filesObj = {}; filesObj[filename] = { content: payload };
 
     try {
-      // dedupe against READ_SEEN set
-      const added = await redis.sadd(READ_SEEN, String(id));
-      if (added === 1) {
-        await redis.rpush(READ_LIST, JSON.stringify(parsed));
-        flushed++;
-      } else {
-        // duplicate, skip
-      }
-    } catch (e) {
-      console.error("Error during dedupe/push", e?.message ?? e);
-      // move back to input to prevent data loss
-      await redis.lpush(INPUT_LIST, s);
-    }
-
-    // remove from processing list
-    await redis.lrem(PROCESSING_LIST, 1, s);
-
-    // throttle to avoid long loops in one go (optional)
-    if (flushed && flushed % CHUNK_SIZE === 0) {
-      // allow other operations
-      await new Promise((r) => setTimeout(r, 10));
+      await patchGistWithRetries(gistId, filesObj);
+      storedTotal.push(...toTake);
+      remaining = remaining.slice(toTake.length);
+      // if remaining > 0, next iteration will re-fetch latest and try again
+    } catch (e){
+      console.warn(`safeAppendToGist: patch failed (attempt ${attempt}) for ${gistId}: ${e.message}`);
+      await sleep(jitterBackoff(attempt));
+      continue;
     }
   }
 
-  return { flushed, bootstrap: false };
+  return { stored: storedTotal, notStored: remaining, updatedArray: null };
 }
 
-// --- read helper
-async function readSlice(offset, count) {
-  const end = offset + count - 1;
-  const arr = await redis.lrange(READ_LIST, offset, end);
-  // always return JSON objects: parse if possible, otherwise wrap as { text: ... }
-  return arr
-    .map((s) => {
-      if (!s) return null;
-      try {
-        return JSON.parse(s);
-      } catch {
-        return { text: s };
-      }
-    })
-    .filter(Boolean);
-}
-
-// --- API handlers (single route /collector)
+// ----------------- ROUTES -----------------
 app.options("/collector", (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -288,159 +344,159 @@ app.options("/collector", (req, res) => {
   res.status(200).end();
 });
 
-app.get("/collector", async (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-SECRET");
-
-  try {
-    await checkAndResetDaily();
-
-    const q = req.query || {};
-    // only accept `batch` param for GET. default to 1 if missing/invalid
-    const batchParam = q.batch;
-    const batchNum = Math.max(parseInt(batchParam || "1", 10) || 1, 1);
-
-    const batchSize = Math.min(
-      Math.max(
-        parseInt(q.batch_size || String(READ_BATCH_SIZE), 10) ||
-          READ_BATCH_SIZE,
-        1
-      ),
-      500
-    );
-    const total = Number((await redis.llen(READ_LIST)) || 0);
-    const batchCount = total > 0 ? Math.ceil(total / batchSize) : 0;
-    const batch = Array.from({ length: batchCount }, (_, i) => i + 1);
-
-    if (batchCount === 0) {
-      return res
-        .status(200)
-        .json({ batches: [], total, batch_count: 0, batch: [] });
-    }
-
-    if (batchNum > batchCount) {
-      return res
-        .status(200)
-        .json({
-          batches: [{ idx: batchNum, count: 0, posts: [] }],
-          total,
-          batch_count: batchCount,
-          batch,
-        });
-    }
-
-    const start = (batchNum - 1) * batchSize;
-    const slice = await readSlice(start, batchSize);
-    const result = [{ idx: batchNum, count: slice.length, posts: slice }];
-
-    return res
-      .status(200)
-      .json({ batches: result, total, batch_count: batchCount, batch });
-  } catch (err) {
-    console.error("GET /collector unhandled", err);
-    return res.status(500).json({ error: err?.message ?? "internal" });
-  }
-});
-
-// Dedicated flush endpoint (POST) to avoid extra GET params
-app.post("/collector/flush", async (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-SECRET");
-  try {
-    if (FLUSH_SECRET) {
-      const provided = req.headers["x-secret"] || req.headers["X-SECRET"];
-      if (!provided || provided !== FLUSH_SECRET) {
-        return res.status(401).json({ error: "Invalid flush secret" });
-      }
-    }
-    const token = await acquireLock();
-    if (!token) return res.status(423).json({ error: "Flush in progress" });
-    try {
-      const result = await flushAll();
-      return res.status(200).json(result);
-    } finally {
-      await releaseLock();
-    }
-  } catch (err) {
-    console.error("POST /collector/flush unhandled", err);
-    return res.status(500).json({ error: err?.message ?? "internal" });
-  }
-});
-
+// POST /collector
 app.post("/collector", async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-SECRET");
-
   try {
     await checkAndResetDaily();
 
     let items = [];
     if (Array.isArray(req.body)) items = req.body;
     else if (req.body && Array.isArray(req.body.posts)) items = req.body.posts;
-    else
-      return res
-        .status(400)
-        .json({ error: "Body must be array or { posts: [...] }" });
+    else return res.status(400).json({ error: "Body must be array or { posts: [...] }" });
 
-    let accepted = 0,
-      skipped = 0;
-    for (const it of items) {
-      const id = itemIdOf(it);
-      const serialized = JSON.stringify(it);
-      if (!id) {
-        await redis.rpush(INPUT_LIST, serialized);
-        accepted++;
-      } else {
-        const alreadyRead = await redis.sismember(READ_SEEN, String(id));
-        if (alreadyRead) {
-          skipped++;
-          continue;
-        }
-        const added = await redis.sadd(INPUT_SEEN, String(id));
-        if (added === 1) {
-          await redis.rpush(INPUT_LIST, serialized);
-          accepted++;
-        } else skipped++;
+    if (items.length === 0) return res.status(400).json({ error: "No items provided" });
+
+    // normalize to objects
+    items = items.map(it => (typeof it === "object" ? it : { text: String(it) }));
+
+    // read id_global (dedupe)
+    const seenSet = await getIdGlobalSet();
+
+    const incomingById = [];
+    const incomingNoId = [];
+    let skipped = 0;
+    for (const it of items){
+      const id = it?.rest_id ?? it?.id ?? null;
+      if (!id) incomingNoId.push(it);
+      else {
+        if (seenSet.has(String(id))) skipped++;
+        else incomingById.push({ id: String(id), obj: it });
       }
     }
 
-    const totalInput = Number((await redis.llen(INPUT_LIST)) || 0);
-    return res
-      .status(201)
-      .json({ accepted, skipped, total_in_input: totalInput });
-  } catch (err) {
-    console.error("POST /collector unhandled", err);
+    const newItemsObjs = [...incomingById.map(x => x.obj), ...incomingNoId];
+    if (newItemsObjs.length === 0){
+      return res.status(200).json({ accepted: 0, skipped, stored: 0 });
+    }
+
+    const dataUtamaList = await readAllDataUtama();
+
+    let remaining = newItemsObjs.slice();
+    const storedItems = [];
+    const updatedGists = [];
+
+    for (let i = 0; i < dataUtamaList.length && remaining.length > 0; i++){
+      const entry = dataUtamaList[i];
+      try {
+        const result = await safeAppendToGist(entry, remaining);
+        if (result.stored && result.stored.length > 0){
+          storedItems.push(...result.stored);
+          updatedGists.push(entry.gistId);
+        }
+        remaining = result.notStored;
+      } catch (e){
+        console.warn(`safeAppendToGist failed for gist ${entry.gistId}: ${e.message}`);
+        continue;
+      }
+    }
+
+    // update id_global only for ids that were actually stored
+    const storedIds = storedItems
+      .map(it => it?.rest_id ?? it?.id ?? null)
+      .filter(Boolean)
+      .map(String);
+
+    if (storedIds.length > 0){
+      const merged = new Set([...Array.from(await getIdGlobalSet()), ...storedIds]);
+      await writeIdGlobalSet(Array.from(merged));
+    }
+
+    const response = {
+      accepted: newItemsObjs.length,
+      skipped,
+      stored: storedItems.length,
+      not_stored: remaining.length,
+      stored_gists: Array.from(new Set(updatedGists)),
+      not_stored_examples: remaining.slice(0,5)
+    };
+
+    if (remaining.length > 0){
+      response.warning = `Not enough capacity in configured GIST_DATA_UTAMA; ${remaining.length} items not stored. Add more gist IDs to GIST_DATA_UTAMA env.`;
+      return res.status(202).json(response);
+    }
+
+    return res.status(201).json(response);
+
+  } catch (err){
+    console.error("POST /collector error:", err);
     return res.status(500).json({ error: err?.message ?? "internal" });
   }
 });
 
-// small health & metrics
-app.get("/health", async (req, res) => {
+// GET /collector with batch support
+// query: ?batch=1&batch_size=200
+app.get("/collector", async (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
   try {
-    const inputLen = Number((await redis.llen(INPUT_LIST)) || 0);
-    const readLen = Number((await redis.llen(READ_LIST)) || 0);
-    const procLen = Number((await redis.llen(PROCESSING_LIST)) || 0);
-    const inputSeen = Number((await redis.scard(INPUT_SEEN)) || 0);
-    const readSeen = Number((await redis.scard(READ_SEEN)) || 0);
-    res.json({ ok: true, inputLen, readLen, procLen, inputSeen, readSeen });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message ?? e });
+    await checkAndResetDaily();
+
+    const q = req.query || {};
+    const batchParam = q.batch;
+    const batchNum = Math.max(parseInt(batchParam || "1", 10) || 1, 1);
+
+    const defaultBatchSize = READ_BATCH_SIZE;
+    const batchSize = Math.min(Math.max(parseInt(q.batch_size || String(defaultBatchSize), 10) || defaultBatchSize, 1), 500);
+
+    const dataUtamaList = await readAllDataUtama();
+    const merged = [];
+    for (const e of dataUtamaList) {
+      if (Array.isArray(e.array)) merged.push(...e.array);
+    }
+
+    const total = merged.length;
+    const batchCount = total > 0 ? Math.ceil(total / batchSize) : 0;
+    const batchArr = Array.from({ length: batchCount }, (_, i) => i + 1);
+
+    if (batchCount === 0) {
+      return res.status(200).json({ batches: [], total, batch_count: 0, batch: [] });
+    }
+
+    if (batchNum > batchCount) {
+      return res.status(200).json({
+        batches: [{ idx: batchNum, count: 0, posts: [] }],
+        total,
+        batch_count: batchCount,
+        batch: batchArr,
+      });
+    }
+
+    const start = (batchNum - 1) * batchSize;
+    const slice = merged.slice(start, start + batchSize);
+    const result = [{ idx: batchNum, count: slice.length, posts: slice }];
+
+    return res.status(200).json({ batches: result, total, batch_count: batchCount, batch: batchArr });
+  } catch (err) {
+    console.error("GET /collector error:", err);
+    return res.status(500).json({ error: err?.message ?? "internal" });
   }
 });
 
-// startup tasks
+// health
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    gist_data_utama_count: DATA_UTAMA_GISTS.length,
+    gist_id_global: !!GIST_ID_GLOBAL,
+    max_items_per_file: MAX_ITEMS_PER_FILE,
+    tokens: TOKENS.length
+  });
+});
+
+// local dev server (only when not production)
 const PORT = parseInt(process.env.PORT || "3000", 10);
-(async () => {
-  try {
-    await recoverProcessingList();
-    app.listen(PORT, () =>
-      console.log(`membit-collector server running on port ${PORT}`)
-    );
-  } catch (e) {
-    console.error("Failed to start server", e);
-    process.exit(1);
-  }
-})();
+if (process.env.NODE_ENV !== "production") {
+  app.listen(PORT, () => console.log(`membit-collector server running on port ${PORT}`));
+}
+
+export default app;
