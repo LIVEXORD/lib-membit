@@ -11,7 +11,45 @@ import fetch from "node-fetch";
 
 const app = express();
 app.use(morgan("tiny"));
-app.use(bodyParser.json({ limit: "2mb" }));
+// Use a tolerant JSON body parser to avoid `request size did not match content length` errors
+// (some proxies / clients may send incorrect Content-Length headers). This parser reads the stream
+// manually and enforces a hard byte limit.
+const MAX_BODY_BYTES = Math.max(1024, parseInt(process.env.MAX_BODY_BYTES || "2097152", 10)); // default 2MB
+app.use((req, res, next) => {
+  // Only parse JSON-ish content here; let other routes pass through
+  const ct = (req.headers['content-type'] || '').toLowerCase();
+  if (!ct.includes('application/json')) return next();
+
+  let received = 0;
+  let chunks = '';
+  req.setEncoding('utf8');
+
+  req.on('data', (chunk) => {
+    received += chunk.length;
+    if (received > MAX_BODY_BYTES) {
+      // stop parsing and fail fast
+      req.connection && req.connection.destroy && req.connection.destroy();
+      return; // stream will end with error on client side
+    }
+    chunks += chunk;
+  });
+
+  req.on('end', () => {
+    if (!chunks) { req.body = {}; return next(); }
+    try {
+      req.body = JSON.parse(chunks);
+      return next();
+    } catch (e) {
+      console.warn('tolerant-parser: invalid json', e.message);
+      return res.status(400).json({ error: 'invalid JSON' });
+    }
+  });
+
+  req.on('error', (err) => {
+    console.warn('tolerant-parser error', err && err.message);
+    return res.status(400).json({ error: 'request read error' });
+  });
+});
 
 // ----------------- CONFIG (ENV) -----------------
 const TOKENS = (process.env.GITHUB_TOKENS || "")
@@ -526,9 +564,12 @@ app.get("/health", (req, res) => {
   });
 });
 
-import serverless from "serverless-http";
+// For Vercel, exporting the Express app directly can be used as the default handler.
+// serverless-http wrapper is optional for Vercel and can introduce extra overhead. Exporting the
+// app directly usually works: Vercel will call it as a Node.js serverless function (app is a function).
+// If you prefer to keep serverless-http for other providers, you can revert to `export default serverless(app);`.
 
-export default serverless(app);
+export default app;
 
 /*
 DEPLOY NOTES (Vercel):
