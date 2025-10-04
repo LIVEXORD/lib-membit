@@ -586,6 +586,12 @@ app.get("/health", (req, res) => {
 
 import serverless from "serverless-http";
 
+// Start a local HTTP server when not in production for quick dev testing
+if (process.env.NODE_ENV !== "production") {
+  const port = parseInt(process.env.PORT || "3000", 10);
+  app.listen(port, () => console.log(`collector dev server listening at http://localhost:${port}`));
+}
+
 // Export serverless handler for Vercel — this provides the proper (req,res) function wrapper
 export default serverless(app);
 
