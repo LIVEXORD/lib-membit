@@ -4,8 +4,9 @@
   "main": "collector.js",
   "type": "module",
   "scripts": {
-    "dev": "vercel dev",
-    "start": "node -r dotenv/config collector.js"
+    "dev": "NODE_ENV=development node api/collector.js",
+    "start": "NODE_ENV=production node api/collector.js",
+    "dev:watch": "NODE_ENV=development npx nodemon --watch . --ext js,json --exec \"node collector-fixed.js\""
   },
   "dependencies": {
     "@upstash/redis": "^1.35.4",
@@ -15,5 +16,8 @@
     "morgan": "^1.10.0",
     "node-fetch": "^3.3.2",
     "serverless-http": "^4.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
   }
 }

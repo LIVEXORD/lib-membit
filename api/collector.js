@@ -8,6 +8,13 @@ import express from "express";
 import bodyParser from "body-parser";
 import morgan from "morgan";
 import fetch from "node-fetch";
+import dotenv from "dotenv";
+
+// Load .env in non-production (local dev). Place your local env vars in a .env file at project root.
+if (process.env.NODE_ENV !== "production") {
+  dotenv.config({ path: process.env.ENV_PATH || ".env" });
+  console.log("[env] loaded for dev, GITHUB_TOKENS count:", (process.env.GITHUB_TOKENS || "").split(",").filter(Boolean).length);
+}
 
 const app = express();
 app.use(morgan("tiny"));
@@ -282,6 +289,13 @@ async function checkAndResetDaily(){
   const today = utcYMD();
   try {
     const last = await getDateFromSelectedGist();
+    // If last is null, this is likely first-run / uninitialized. Do NOT clear existing gists in that case.
+    // Instead, initialize the date gist to avoid accidental wipes on first run.
+    if (last === null) {
+      console.log("checkAndResetDaily: date gist uninitialized. Initializing to", today, "and skipping clear.");
+      await writeDateToSelectedGist(today);
+      return;
+    }
     if (last === today) return;
     console.log("Daily reset triggered. last_date:", last, "today:", today);
     const dateGistId = pickDateGistId();
