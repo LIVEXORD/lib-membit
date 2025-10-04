@@ -129,6 +129,18 @@ export default async function handler(req, res) {
         if (!token) return res.status(423).json({ error: "Flush in progress" });
 
         try {
+          // --- improved flush logic ---
+          // preload current READ_LIST ids once (to avoid lrange per item)
+          const rawRead = await redis.lrange(READ_LIST, 0, -1);
+          const readIdSet = new Set();
+          for (const s of rawRead) {
+            try {
+              const obj = JSON.parse(s);
+              const id = itemIdOf(obj);
+              if (id) readIdSet.add(String(id));
+            } catch {}
+          }
+
           let toPushAll = [];
           while (true) {
             const chunk = await popChunk(CHUNK_SIZE);
@@ -137,17 +149,29 @@ export default async function handler(req, res) {
             const newOnes = [];
             for (const it of chunk) {
               const id = itemIdOf(it);
+
               if (!id) {
+                // no stable id → accept and generate one
                 it._generated_id = `_noid_${Math.random().toString(36).slice(2, 9)}`;
                 newOnes.push(it);
-              } else {
-                const added = await redis.sadd(READ_SEEN, String(id));
-                if (added === 1) newOnes.push(it);
+                continue;
               }
+
+              // If id already exists in READ_LIST (tracked in readIdSet), skip
+              if (readIdSet.has(String(id))) {
+                // already in read_list -> skip
+                continue;
+              }
+
+              // Not present in read_list -> safe to push (covers both new & "seen-but-not-pushed" recover)
+              await redis.rpush(READ_LIST, JSON.stringify(it));
+              // ensure READ_SEEN contains it (idempotent)
+              await redis.sadd(READ_SEEN, String(id));
+              readIdSet.add(String(id)); // update local cache so subsequent checks are fast
+              newOnes.push(it);
             }
+
             if (newOnes.length) {
-              const jsons = newOnes.map((x) => JSON.stringify(x));
-              await redis.rpush(READ_LIST, ...jsons);
               toPushAll.push(...newOnes);
             }
           }
