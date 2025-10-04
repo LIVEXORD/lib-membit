@@ -221,6 +221,71 @@ if (typeof globalThis.patchGistWithRetries === 'undefined') {
   };
 }
 
+// ----------------- Helper: fetch gist with SHA and raw content (used by many flows)
+async function fetchGistContentWithSha(gistId){
+  const url = `${GITHUB_API_BASE}/gists/${gistId}`;
+  const { res } = await ghFetchWithRetries(url, { method: 'GET' });
+  if (!res.ok) {
+    const text = await res.text().catch(()=>"");
+    throw new Error(`Failed fetching gist ${gistId}: ${res.status} ${text}`);
+  }
+  const js = await res.json();
+  const files = js.files || {};
+  const preferredNames = ["data_utama.json","data_id_global.json","data_tanggal.json"];
+  let chosenName = Object.keys(files)[0] || null;
+  for (const pn of preferredNames) { if (files[pn]) { chosenName = pn; break; } }
+  if (!chosenName) return { gistMeta: js, filename: null, content: null, contentRaw: null, fileSha: null, rawUrl: null };
+  const file = files[chosenName];
+  const rawUrl = file.raw_url || null;
+  let contentRaw = file.content || null;
+  if (rawUrl) {
+    try {
+      const { res: rRaw } = await ghFetchWithRetries(rawUrl, { method: 'GET' });
+      contentRaw = await rRaw.text().catch(()=> file.content || "");
+    } catch(e){ contentRaw = file.content || ""; }
+  }
+  let parsed = null;
+  try { parsed = JSON.parse(contentRaw); } catch(e){ parsed = null; }
+  return { gistMeta: js, filename: chosenName, content: parsed, contentRaw, fileSha: file.sha, rawUrl };
+}
+
+// Patch once helper that accepts optional fileSha (fast path used by safe append)
+async function patchGistOnce(gistId, filename, newContent, fileSha=null){
+  const url = `${GITHUB_API_BASE}/gists/${gistId}`;
+  const body = { files: {} };
+  body.files[filename] = { content: JSON.stringify(newContent, null, 2) };
+  if (fileSha) body.files[filename].sha = fileSha;
+  const opts = { method: 'PATCH', headers: { 'Content-Type': 'application/json', 'User-Agent': USER_AGENT }, body: JSON.stringify(body) };
+  const { res } = await ghFetchWithRetries(url, opts);
+  if (!res.ok) {
+    const t = await res.text().catch(()=>"");
+    throw new Error(`Failed PATCH gist ${gistId}: ${res.status} ${t}`);
+  }
+  const j = await res.json();
+  console.log(`[PATCH ONCE] gist=${gistId} file=${filename} status=${res.status}`);
+  return j;
+}
+
+// Simple safe append: fetch once, compute new array, single patch (fast-fail on conflict)
+async function safeAppendToGistSimple(gistEntry, incomingItems){
+  const { gistId, filename } = gistEntry;
+  const fetched = await fetchGistContentWithSha(gistId);
+  const existingArray = Array.isArray(fetched.content) ? fetched.content : (fetched.content && Array.isArray(fetched.content.posts) ? fetched.content.posts : []);
+  const fileSha = fetched.fileSha || null;
+  const available = Math.max(0, MAX_ITEMS_PER_FILE - existingArray.length);
+  if (available <= 0) return { stored: [], notStored: incomingItems, updatedArray: existingArray };
+  const toTake = incomingItems.slice(0, available);
+  const newArr = existingArray.concat(toTake);
+  try {
+    await patchGistOnce(gistId, fetched.filename || (filename || 'data_utama.json'), newArr, fileSha);
+    return { stored: toTake, notStored: incomingItems.slice(toTake.length), updatedArray: newArr };
+  } catch(e){
+    console.warn(`safeAppendToGistSimple: patch failed for ${gistId}: ${e.message}`);
+    // on conflict or other error, fail-fast and return nothing stored
+    return { stored: [], notStored: incomingItems, updatedArray: existingArray };
+  }
+}
+
 // ----------------- Date gist selection & daily reset -----------------
 function pickDateGistId(){
   if (process.env.GIST_DATA_TANGGAL && process.env.GIST_DATA_TANGGAL.trim()) return process.env.GIST_DATA_TANGGAL.trim();
