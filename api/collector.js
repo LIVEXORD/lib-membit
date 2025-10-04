@@ -183,59 +183,42 @@ const GITHUB_API_BASE = (process.env.GITHUB_API_BASE || "https://api.github.com"
 
 // Compatibility wrapper: patch helper used across the codebase. This uses the same
 // ghFetchWithRetries flow and returns parsed JSON on success.
-async function patchGistWithRetries(gistId, filesObj) {
-  const url = `${GITHUB_API_BASE}/gists/${gistId}`;
-  const opts = {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json", "User-Agent": USER_AGENT },
-    body: JSON.stringify({ files: filesObj })
+if (typeof globalThis.patchGistWithRetries === 'undefined') {
+  globalThis.patchGistWithRetries = async function(gistId, filesObj) {
+    const url = `${GITHUB_API_BASE}/gists/${gistId}`;
+    const opts = {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", "User-Agent": USER_AGENT },
+      body: JSON.stringify({ files: filesObj })
+    };
+    const { res } = await ghFetchWithRetries(url, opts);
+    if (!res.ok) {
+      const text = await res.text().catch(()=>"");
+      throw new Error(`Failed PATCH gist ${gistId}: ${res.status} ${text}`);
+    }
+    const j = await res.json();
+    console.log(`[PATCH RESP] gist=${gistId} files=${Object.keys(filesObj).join(',')} status=${res.status}`);
+    return j;
   };
-  const { res } = await ghFetchWithRetries(url, opts);
-  if (!res.ok) {
-    const text = await res.text().catch(()=>"");
-    throw new Error(`Failed PATCH gist ${gistId}: ${res.status} ${text}`);
-  }
-  const j = await res.json();
-  console.log(`[PATCH RESP] gist=${gistId} files=${Object.keys(filesObj).join(',')} status=${res.status}`);
-  return j;
-} 
-
-// fetch gist and parse sensible file (prefers data_utama.json / data_id_global.json / data_tanggal.json)
-async function fetchGistContent(gistId){
-  const url = `https://api.github.com/gists/${gistId}`;
-  const { res } = await ghFetchWithRetries(url, { method: "GET" });
-  if (!res.ok){
-    const text = await res.text().catch(()=>"");
-    throw new Error(`Failed fetching gist ${gistId}: ${res.status} ${text}`);
-  }
-  const js = await res.json();
-  const files = js.files || {};
-  const preferredNames = ["data_utama.json", "data_id_global.json", "data_tanggal.json"];
-  let chosenName = Object.keys(files)[0] || null;
-  for (const pn of preferredNames){
-    if (files[pn]) { chosenName = pn; break; }
-  }
-  if (!chosenName) return { gistMeta: js, filename: null, content: null, contentRaw: null };
-  const file = files[chosenName];
-  const contentRaw = file.content || "";
-  let parsed = null;
-  try { parsed = JSON.parse(contentRaw); } catch (e) { parsed = null; }
-  return { gistMeta: js, filename: chosenName, content: parsed, contentRaw };
 }
 
-async function patchGistWithRetries(gistId, filesObj){
-  const url = `https://api.github.com/gists/${gistId}`;
-  const opts = {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json", "User-Agent": USER_AGENT },
-    body: JSON.stringify({ files: filesObj })
+if (typeof globalThis.patchGistWithRetries === 'undefined') {
+  globalThis.patchGistWithRetries = async function(gistId, filesObj) {
+    const url = `${GITHUB_API_BASE}/gists/${gistId}`;
+    const opts = {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", "User-Agent": USER_AGENT },
+      body: JSON.stringify({ files: filesObj })
+    };
+    const { res } = await ghFetchWithRetries(url, opts);
+    if (!res.ok) {
+      const text = await res.text().catch(()=>"");
+      throw new Error(`Failed PATCH gist ${gistId}: ${res.status} ${text}`);
+    }
+    const j = await res.json();
+    console.log(`[PATCH RESP] gist=${gistId} files=${Object.keys(filesObj).join(',')} status=${res.status}`);
+    return j;
   };
-  const { res } = await ghFetchWithRetries(url, opts);
-  if (!res.ok){
-    const text = await res.text().catch(()=>"");
-    throw new Error(`Failed PATCH gist ${gistId}: ${res.status} ${text}`);
-  }
-  return res.json();
 }
 
 // ----------------- Date gist selection & daily reset -----------------
