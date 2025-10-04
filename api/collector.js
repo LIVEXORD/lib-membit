@@ -493,10 +493,6 @@ app.get("/health", (req, res) => {
   });
 });
 
-// local dev server (only when not production)
-const PORT = parseInt(process.env.PORT || "3000", 10);
-if (process.env.NODE_ENV !== "production") {
-  app.listen(PORT, () => console.log(`membit-collector server running on port ${PORT}`));
-}
+import serverless from "serverless-http";
 
-export default app;
+export default serverless(app);
