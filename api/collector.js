@@ -373,54 +373,10 @@ function jitterBackoff(attempt, baseMs = SYNC_RETRY_BASE_MS){
  incomingItems: array of objects to store
  returns { stored: [...], notStored: [...], updatedArray: [...] }
 */
-async function safeAppendToGist(gistEntry, incomingItems){
-  const { gistId, filename } = gistEntry;
-  let remaining = incomingItems.slice();
-  const storedTotal = [];
-
-  for (let attempt = 0; attempt < MAX_SYNC_ATTEMPTS && remaining.length > 0; attempt++){
-    let latest;
-    try {
-      latest = await fetchGistContent(gistId);
-    } catch (e){
-      console.warn(`safeAppendToGist: fetch failed (attempt ${attempt}) for ${gistId}: ${e.message}`);
-      await sleep(jitterBackoff(attempt));
-      continue;
-    }
-
-    let existingArray = [];
-    if (Array.isArray(latest.content)) existingArray = latest.content;
-    else if (latest.content && Array.isArray(latest.content.posts)) existingArray = latest.content.posts;
-    else existingArray = [];
-
-    const available = Math.max(0, MAX_ITEMS_PER_FILE - existingArray.length);
-    if (available <= 0){
-      return { stored: storedTotal, notStored: remaining, updatedArray: existingArray };
-    }
-
-    const toTake = remaining.slice(0, available);
-    const newArray = existingArray.concat(toTake);
-    const payload = JSON.stringify(newArray, null, 2);
-    const filesObj = {}; filesObj[filename] = { content: payload };
-
-    try {
-      await patchGistWithRetries(gistId, filesObj);
-      storedTotal.push(...toTake);
-      remaining = remaining.slice(toTake.length);
-      // if remaining > 0, next iteration will re-fetch latest and try again
-    } catch (e){
-      console.warn(`safeAppendToGist: patch failed (attempt ${attempt}) for ${gistId}: ${e.message}`);
-      await sleep(jitterBackoff(attempt));
-      continue;
-    }
-  }
-
-  return { stored: storedTotal, notStored: remaining, updatedArray: null };
-}
-
-// alias for compatibility with older callsites
-async function safeAppendToGist(gistEntry, incomingItems){
-  return safeAppendToGistSimple(gistEntry, incomingItems);
+if (typeof globalThis.safeAppendToGist === 'undefined') {
+  globalThis.safeAppendToGist = async function(gistEntry, incomingItems){
+    return safeAppendToGistSimple(gistEntry, incomingItems);
+  };
 }
 
 // ----------------- ROUTES -----------------
