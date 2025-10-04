@@ -1,4 +1,4 @@
-// membit-collector-server.js
+// collector.js
 // ESM Express app — stateless, Vercel-ready.
 // Dependencies: express, body-parser, morgan, node-fetch
 // Install: npm i express body-parser morgan node-fetch
