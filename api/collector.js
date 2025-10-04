@@ -379,6 +379,13 @@ if (typeof globalThis.safeAppendToGist === 'undefined') {
   };
 }
 
+// Backwards-compatible alias: some older code calls fetchGistContent(gistId)
+if (typeof globalThis.fetchGistContent === 'undefined') {
+  globalThis.fetchGistContent = async function(gistId){
+    return fetchGistContentWithSha(gistId);
+  };
+}
+
 // ----------------- ROUTES -----------------
 // Support both root (when deployed as api/collector) and explicit /collector paths
 app.options(["/collector", "/"], (req, res) => {
